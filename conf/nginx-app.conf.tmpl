@@ -1,0 +1,70 @@
+{{- /*
+    Finished nginx vhost template — B3 (pipe-improves.md §2.2/§5 B3).
+    Rendered by internal/render.Render (text/template, never html/template —
+    this output is nginx config) against a render.Payload built from the
+    validated POST /v1/apply body.
+
+    Contract the listener (internal/nginx) and its DELETE handler depend on:
+    the *first rendered line* MUST be the "# managed-by:" header — it is the
+    marker that authorizes overwriting/removing this file (§2.2 "sempre com
+    o header # managed-by: na primeira linha"; hand-written confs without it
+    are never touched).
+
+    Variants:
+      - Websocket:      true  -> adds Upgrade/Connection "upgrade" headers
+                                  (n8n/livekit/penpot-style backends).
+      - Cache.Enabled:  true  -> adds a proxy_cache zone + directives, for
+                                  static sites (e.g. www.workspacefy.com).
+      - Timeouts:              proxy_{connect,read,send}_timeout, seconds.
+*/ -}}
+# managed-by: deployer-lb-server app={{.PipelineRef}} revision={{.Revision}}
+{{- range .Domains}}
+## {{.}}
+{{- end}}
+{{- if .Cache.Enabled}}
+proxy_cache_path /var/cache/nginx/{{ upstreamName .PipelineRef }} levels=1:2 keys_zone={{ upstreamName .PipelineRef }}_cache:10m max_size=1g inactive=60m use_temp_path=off;
+{{- end}}
+upstream {{ upstreamName .PipelineRef }} {
+{{- range .Upstreams}}
+    server {{.IP}}:{{.Port}};
+{{- end}}
+    keepalive 16;
+    keepalive_timeout 60s;
+}
+
+server {
+    listen 80;                          # D11: HTTP puro na origem (cert é da CF, na borda)
+    server_name {{ join .Domains " " }};
+    underscores_in_headers on;
+    include snippets/error-pages.conf;
+    include snippets/cloudflare-real-ip.conf;   # set_real_ip_from <ranges CF> + real_ip_header CF-Connecting-IP
+
+    location / {
+        proxy_pass http://{{ upstreamName .PipelineRef }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+{{- if .Websocket}}
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+{{- end}}
+
+        proxy_connect_timeout {{.Timeouts.Connect}}s;
+        proxy_read_timeout {{.Timeouts.Read}}s;
+        proxy_send_timeout {{.Timeouts.Send}}s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+{{- if .Cache.Enabled}}
+
+        proxy_cache {{ upstreamName .PipelineRef }}_cache;
+        proxy_cache_valid 200 302 10m;
+        proxy_cache_valid 404 1m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        add_header X-Cache-Status $upstream_cache_status;
+{{- end}}
+    }
+}

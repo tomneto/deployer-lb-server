@@ -1,0 +1,35 @@
+[Unit]
+Description=deployer-lb-server (agent mode) - infra/docker/wireguard reporter
+Documentation=https://github.com/tomneto/deployer-lb-server
+# WireGuard must be up before the agent can inspect/ping it, and Docker must
+# be up before `docker ps` succeeds — but neither is a hard requirement to
+# start (CollectWireGuard/CollectContainers degrade to OK:false instead of
+# erroring, per D5/B2 "nunca deve travar/derrubar o processo").
+After=network-online.target docker.service wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# All configuration is read from the environment (INTAKE_URL/AGENT_ID/
+# AGENT_TOKEN/AGENT_INTERVAL/AGENT_WG_IFACE/AGENT_BUFFER_DIR — see
+# cmd/agent/main.go's envOr()); no ExecStart flags needed. setup.sh writes
+# this file with the values it collected at provisioning time (§2.4 step 4:
+# "grava .env com INTAKE_URL/AGENT_TOKEN", secrets never in the repo/unit).
+EnvironmentFile=/etc/deployer-lb-agent/.env
+ExecStart=/usr/local/bin/deployer-lb-agent
+Restart=always
+RestartSec=5s
+
+# Runs as root: `wg show <iface> dump` requires root (it can expose peer
+# metadata) and `docker ps`/`docker inspect` need either root or docker-group
+# membership — root keeps setup.sh from having to manage a dedicated user/
+# group + docker-group membership across distros. Hardening is still applied
+# where it doesn't conflict with those needs.
+StateDirectory=deployer-lb-agent
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/deployer-lb-agent
+
+[Install]
+WantedBy=multi-user.target

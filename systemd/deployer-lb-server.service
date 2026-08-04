@@ -1,0 +1,25 @@
+[Unit]
+Description=Deployer LB Server (nginx apply listener, mode "lb")
+Documentation=https://github.com/tomneto/deployer-lb-server
+After=network-online.target nginx.service
+Wants=network-online.target
+Requires=nginx.service
+
+[Service]
+Type=simple
+# Populated by setup.sh at install/rotation time; never committed (D8/§2.4).
+EnvironmentFile=-/etc/deployer-lb-server/lb.env
+ExecStart=/usr/local/bin/deployer-lb-server \
+    --addr=${LB_LISTEN_ADDR} \
+    --conf-dir=${NGINX_CONF_DIR} \
+    --template=${NGINX_TEMPLATE_PATH}
+Restart=on-failure
+RestartSec=2
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/nginx
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
