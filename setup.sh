@@ -58,6 +58,10 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 NGINX_TEMPLATE_DIR="/etc/nginx/lb-templates"
 NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
 NGINX_MIN_VERSION="1.18.0"
+# wireguard-tools versiona por data (ex.: v1.0.20210914) desde que o módulo
+# foi mainlined no kernel 5.6 (2020) — 1.0.20200513 é a primeira release
+# estável pós-mainline, piso seguro pra qualquer distro atual.
+WG_MIN_VERSION="1.0.20200513"
 
 # agent-mode options
 INTAKE_URL=""
@@ -115,19 +119,65 @@ fi
 # Step 1 — Dependencies
 # ---------------------------------------------------------------------------
 
-nginx_version_ge() {
-    # $1 = installed version, $2 = minimum required version (both "x.y.z")
+version_ge() {
+    # $1 = installed version, $2 = minimum required version (both "x.y.z...")
     local a="$1" b="$2"
     [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" == "$b" ]]
 }
 
+wg_installed_version() {
+    # `wg --version` prints "wireguard-tools v1.0.20210914" — extract just the
+    # number (no "v"), same shape version_ge already expects.
+    wg --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+install_or_upgrade_wireguard_tools() {
+    if have apt-get; then
+        apt-get update -y && apt-get install -y --only-upgrade wireguard-tools \
+            || apt-get install -y wireguard-tools
+    elif have dnf; then
+        dnf install -y wireguard-tools  # dnf install already upgrades in place
+    elif have yum; then
+        yum install -y wireguard-tools
+    else
+        die "no supported package manager found (apt-get/dnf/yum) to install/upgrade wireguard-tools"
+    fi
+}
+
+# Shared by both modes: `lb` needs wireguard-tools for the hub interface
+# (step2_wireguard_lb), `agent` needs it for the peer interface — same
+# package, same version floor, same install-or-upgrade decision either way.
+ensure_wireguard_tools_version() {
+    if have wg; then
+        local wg_ver
+        wg_ver="$(wg_installed_version)"
+        if [[ -z "$wg_ver" ]]; then
+            log "warning: wg present but version could not be determined, attempting upgrade"
+            wg_ver="0.0.0"
+        fi
+        if version_ge "$wg_ver" "$WG_MIN_VERSION"; then
+            log "wireguard-tools $wg_ver already installed, OK"
+        else
+            log "wireguard-tools $wg_ver < required $WG_MIN_VERSION — upgrading"
+            install_or_upgrade_wireguard_tools
+            wg_ver="$(wg_installed_version)"
+            [[ -n "$wg_ver" ]] && version_ge "$wg_ver" "$WG_MIN_VERSION" \
+                || die "wireguard-tools upgrade did not reach $WG_MIN_VERSION (got '${wg_ver:-unknown}')"
+            log "wireguard-tools upgraded to $wg_ver, OK"
+        fi
+    else
+        log "wireguard-tools not found, installing"
+        install_or_upgrade_wireguard_tools
+    fi
+}
+
 step1_deps_lb() {
-    log "step 1/6: dependencies (nginx)"
+    log "step 1/6: dependencies (nginx, wireguard-tools)"
     if have nginx; then
         local ver
         ver="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
         [[ -n "$ver" ]] || die "nginx present but version could not be determined"
-        nginx_version_ge "$ver" "$NGINX_MIN_VERSION" \
+        version_ge "$ver" "$NGINX_MIN_VERSION" \
             || die "nginx $ver < required $NGINX_MIN_VERSION"
         nginx -t >/dev/null 2>&1 || log "warning: existing nginx config fails 'nginx -t' (pre-existing issue, not caused by this run)"
         log "nginx $ver already installed, OK"
@@ -143,6 +193,7 @@ step1_deps_lb() {
             die "no supported package manager found (apt-get/dnf/yum) to install nginx"
         fi
     fi
+    ensure_wireguard_tools_version
     have systemctl || die "systemd (systemctl) not found — required for both modes"
 }
 
@@ -155,20 +206,7 @@ step1_deps_agent() {
         curl -fsSL https://get.docker.com | sh
     fi
 
-    if have wg; then
-        log "wireguard-tools already installed, OK"
-    else
-        log "wireguard-tools not found, installing"
-        if have apt-get; then
-            apt-get update -y && apt-get install -y wireguard-tools
-        elif have dnf; then
-            dnf install -y wireguard-tools
-        elif have yum; then
-            yum install -y wireguard-tools
-        else
-            die "no supported package manager found (apt-get/dnf/yum) to install wireguard-tools"
-        fi
-    fi
+    ensure_wireguard_tools_version
     have systemctl || die "systemd (systemctl) not found — required for both modes"
 }
 
