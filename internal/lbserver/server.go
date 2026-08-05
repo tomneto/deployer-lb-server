@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,8 +37,8 @@ type Config struct {
 
 	// Upstream health probing for GET /v1/status (C6): a plain TCP dial per
 	// upstream, cached so repeated status polls stay cheap.
-	HealthDialTimeout time.Duration                                                  // per-dial timeout; defaults to 1s
-	HealthCacheTTL    time.Duration                                                  // probe result reuse window; defaults to 10s
+	HealthDialTimeout time.Duration                                                       // per-dial timeout; defaults to 1s
+	HealthCacheTTL    time.Duration                                                       // probe result reuse window; defaults to 10s
 	DialTimeout       func(network, addr string, timeout time.Duration) (net.Conn, error) // injectable dialer; defaults to net.DialTimeout
 }
 
@@ -60,6 +61,15 @@ func (c *Config) setDefaults() {
 	if c.Logger == nil {
 		c.Logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
+	if c.HealthDialTimeout <= 0 {
+		c.HealthDialTimeout = time.Second
+	}
+	if c.HealthCacheTTL <= 0 {
+		c.HealthCacheTTL = 10 * time.Second
+	}
+	if c.DialTimeout == nil {
+		c.DialTimeout = net.DialTimeout
+	}
 }
 
 // idemRecord remembers that an idempotency key has already been processed,
@@ -81,12 +91,17 @@ type Server struct {
 	mu sync.Mutex
 
 	stateMu         sync.RWMutex
-	appliedRevision map[string]int64  // repo (pipeline_ref) -> last applied revision
+	appliedRevision map[string]int64 // repo (pipeline_ref) -> last applied revision
 	idempotency     map[string]idemRecord
 	domainOwner     map[string]string // domain -> pipeline_ref
 
 	coalMu sync.Mutex
 	slots  map[string]*appSlot // pipeline_ref -> in-flight coalescing slot
+
+	// healthMu guards healthCache, the ~10s TCP-probe memo behind the
+	// `upstreams[].healthy` field of GET /v1/status (C6) — see status.go.
+	healthMu    sync.Mutex
+	healthCache map[string]healthEntry // "host:port" -> last probe result
 }
 
 type applyResult struct {
@@ -111,6 +126,7 @@ func New(cfg Config) *Server {
 		idempotency:     make(map[string]idemRecord),
 		domainOwner:     make(map[string]string),
 		slots:           make(map[string]*appSlot),
+		healthCache:     make(map[string]healthEntry),
 	}
 }
 
@@ -154,12 +170,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.stateMu.RLock()
-	apps := make(map[string]any, len(s.appliedRevision))
-	for repo, rev := range s.appliedRevision {
-		apps[repo] = map[string]any{"applied_revision": rev}
-	}
-	s.stateMu.RUnlock()
+	// apps is rebuilt from the managed confs on disk (see status.go): the
+	// conf.d files *are* the manifest handleApply maintains — filename is
+	// the pipeline_ref, the managed-by header carries the applied revision,
+	// and the upstream/server_name blocks carry hosts and domains. Reading
+	// them back (instead of the in-memory appliedRevision map) keeps
+	// /v1/status correct across process restarts (C6).
+	apps := s.statusApps()
 
 	configOk := true
 	if s.cfg.Runner != nil {

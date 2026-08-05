@@ -13,7 +13,7 @@ const fixtureInspectJSON = `[
     "Id": "abc123",
     "Name": "/app-a",
     "Config": {"Image": "ghcr.io/tomneto/app-a:latest"},
-    "State": {"Status": "running", "Health": {"Status": "healthy"}},
+    "State": {"Status": "running", "Health": {"Status": "healthy"}, "Pid": 3412, "StartedAt": "2026-08-04T11:22:33.123456789Z"},
     "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "10200"}]}}
   },
   {
@@ -33,12 +33,14 @@ func TestParseDockerInspect(t *testing.T) {
 
 	want := []Container{
 		{
-			ID:     "abc123",
-			Name:   "app-a",
-			Image:  "ghcr.io/tomneto/app-a:latest",
-			State:  "running",
-			Health: "healthy",
-			Ports:  []string{"0.0.0.0:10200->8080/tcp"},
+			ID:        "abc123",
+			Name:      "app-a",
+			Image:     "ghcr.io/tomneto/app-a:latest",
+			State:     "running",
+			Health:    "healthy",
+			Ports:     []string{"0.0.0.0:10200->8080/tcp"},
+			Pid:       3412,
+			StartedAt: "2026-08-04T11:22:33.123456789Z",
 		},
 		{
 			ID:    "def456",
@@ -119,5 +121,19 @@ func TestCollectContainers_PsFails(t *testing.T) {
 	}
 	if info.Containers == nil {
 		t.Fatal("expected non-nil empty Containers slice on failure")
+	}
+}
+
+func TestContainerPIDs_Dedup(t *testing.T) {
+	info := DockerInfo{OK: true, Containers: []Container{
+		{ID: "a", Pid: 3412},
+		{ID: "b", Pid: 3412}, // duplicate (shared PID namespace) → deduplicated
+		{ID: "c", Pid: 0},    // stopped container → excluded
+		{ID: "d", Pid: 900},
+	}}
+	got := info.ContainerPIDs()
+	want := []int32{3412, 900}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ContainerPIDs() = %v, want %v", got, want)
 	}
 }

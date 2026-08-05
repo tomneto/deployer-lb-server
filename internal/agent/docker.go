@@ -34,6 +34,10 @@ type dockerInspectEntry struct {
 		Health *struct {
 			Status string `json:"Status"`
 		} `json:"Health"`
+		// Pid/StartedAt feed the C3 cross-referencing: container ↔ host
+		// process (ports/processes sections) ↔ start time.
+		Pid       int32  `json:"Pid"`
+		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
 	NetworkSettings struct {
 		Ports map[string][]struct {
@@ -100,10 +104,12 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 	out := make([]Container, 0, len(entries))
 	for _, e := range entries {
 		c := Container{
-			ID:    e.ID,
-			Name:  strings.TrimPrefix(e.Name, "/"),
-			Image: e.Config.Image,
-			State: e.State.Status,
+			ID:        e.ID,
+			Name:      strings.TrimPrefix(e.Name, "/"),
+			Image:     e.Config.Image,
+			State:     e.State.Status,
+			Pid:       e.State.Pid,
+			StartedAt: e.State.StartedAt,
 		}
 		if e.State.Health != nil {
 			c.Health = e.State.Health.Status
@@ -128,4 +134,19 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// ContainerPIDs returns the unique host PIDs of the running containers, used
+// by CollectProcesses' cardinality filter (container processes are always
+// kept).
+func (d DockerInfo) ContainerPIDs() []int32 {
+	seen := map[int32]bool{}
+	out := make([]int32, 0, len(d.Containers))
+	for _, c := range d.Containers {
+		if c.Pid > 0 && !seen[c.Pid] {
+			seen[c.Pid] = true
+			out = append(out, c.Pid)
+		}
+	}
+	return out
 }

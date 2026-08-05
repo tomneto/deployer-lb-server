@@ -11,7 +11,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 # All configuration is read from the environment (INTAKE_URL/AGENT_ID/
-# AGENT_TOKEN/AGENT_INTERVAL/AGENT_WG_IFACE/AGENT_BUFFER_DIR — see
+# AGENT_TOKEN/AGENT_INTERVAL/AGENT_WG_IFACE/AGENT_BUFFER_DIR, plus the C3
+# observability knobs AGENT_MANAGED_PREFIX/AGENT_UNITS — see
 # cmd/agent/main.go's envOr()); no ExecStart flags needed. setup.sh writes
 # this file with the values it collected at provisioning time (§2.4 step 4:
 # "grava .env com INTAKE_URL/AGENT_TOKEN", secrets never in the repo/unit).

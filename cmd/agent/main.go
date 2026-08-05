@@ -36,8 +36,12 @@ func main() {
 		mountsCSV   = flag.String("mounts", envOr("AGENT_MOUNTS", "/"), "comma-separated mount points to report disk usage for")
 		gitSHA      = flag.String("git-sha", envOr("GIT_SHA", ""), "optional build identifier reported in api.git_sha")
 		environment = flag.String("environment", envOr("ENVIRONMENT", "production"), "reported in api.environment")
-		showVerS    = flag.Bool("v", false, "print version and exit")
-		showVerL    = flag.Bool("version", false, "print version and exit")
+		// Observability collectors (improves.md C3/WS-4): which systemd units
+		// get the detailed `systemctl show` pass in the report.
+		managedPrefix = flag.String("managed-prefix", envOr("AGENT_MANAGED_PREFIX", agent.DefaultManagedPrefix), "systemd unit-name prefix considered deployer-managed (detailed reporting)")
+		unitsCSV      = flag.String("units", envOr("AGENT_UNITS", ""), "comma-separated extra systemd units to report in detail (\".service\" suffix optional)")
+		showVerS      = flag.Bool("v", false, "print version and exit")
+		showVerL      = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -76,26 +80,35 @@ func main() {
 	log.Printf("deployer-lb-agent %s starting: intake=%s agent_id=%s interval=%s", version.Version, *intakeURL, *agentID, *interval)
 
 	runLoop(ctx, sender, loopConfig{
-		hostname:    hostname,
-		agentID:     *agentID,
-		gitSHA:      *gitSHA,
-		environment: *environment,
-		wgIface:     *wgIface,
-		mounts:      mounts,
-		interval:    *interval,
+		hostname:      hostname,
+		agentID:       *agentID,
+		gitSHA:        *gitSHA,
+		environment:   *environment,
+		wgIface:       *wgIface,
+		mounts:        mounts,
+		interval:      *interval,
+		managedPrefix: *managedPrefix,
+		extraUnits:    splitCSV(*unitsCSV),
+		// One process-handle cache for the whole agent lifetime: gopsutil
+		// needs two samples on the same handle for a real cpu_percent, so the
+		// cache must survive across ticks (improves.md WS-4).
+		procCache: agent.NewProcCache(),
 	})
 
 	log.Println("deployer-lb-agent stopped")
 }
 
 type loopConfig struct {
-	hostname    string
-	agentID     string
-	gitSHA      string
-	environment string
-	wgIface     string
-	mounts      []string
-	interval    time.Duration
+	hostname      string
+	agentID       string
+	gitSHA        string
+	environment   string
+	wgIface       string
+	mounts        []string
+	interval      time.Duration
+	managedPrefix string
+	extraUnits    []string
+	procCache     *agent.ProcCache
 }
 
 // runLoop is the core periodic loop, deliberately free of package-level
@@ -144,6 +157,17 @@ func tick(ctx context.Context, sender *agent.Sender, cfg loopConfig) {
 
 func buildReport(cfg loopConfig) agent.Report {
 	now := time.Now().UTC()
+
+	// Ports, docker and systemd run first: their PIDs (port owners, container
+	// init PIDs, managed-unit MainPIDs) pin entries in the processes
+	// cardinality filter (improves.md C3/WS-4).
+	ports := agent.CollectPorts()
+	docker := agent.CollectContainers(agent.ExecRunner)
+	systemd := agent.CollectSystemd(agent.ExecRunner, cfg.managedPrefix, cfg.extraUnits)
+
+	pinned := append(ports.PortPIDs(), systemd.ManagedPIDs()...)
+	pinned = append(pinned, docker.ContainerPIDs()...)
+
 	return agent.Report{
 		Timestamp:    now.Format(time.RFC3339),
 		TargetID:     cfg.agentID,
@@ -153,11 +177,14 @@ func buildReport(cfg loopConfig) agent.Report {
 			GitSHA:      cfg.gitSHA,
 			Environment: cfg.environment,
 		},
-		Server: agent.CollectServer(cfg.mounts),
-		Docker: agent.CollectContainers(agent.ExecRunner),
-		WG:     agent.CollectWireGuard(agent.ExecRunner, agent.ExecPing, cfg.wgIface, now),
-		Vercel: agent.ConfigFlag{Configured: false},
-		N8N:    agent.ConfigFlag{Configured: false},
+		Server:    agent.CollectServer(cfg.mounts),
+		Docker:    docker,
+		WG:        agent.CollectWireGuard(agent.ExecRunner, agent.ExecPing, cfg.wgIface, now),
+		Vercel:    agent.ConfigFlag{Configured: false},
+		N8N:       agent.ConfigFlag{Configured: false},
+		Ports:     ports,
+		Processes: cfg.procCache.CollectProcesses(pinned),
+		Systemd:   systemd,
 	}
 }
 

@@ -8,10 +8,15 @@
 #
 #   bash setup.sh lb    --port <porta> --nginx-conf-dir /etc/nginx/conf.d \
 #                        --wg-ip <wireguard_ip> --wg-port <port> \
-#                        --wg-peers <pubkey:ip,...>
+#                        --wg-peers <pubkey:ip,...> \
+#                        [--intake-url <url> --agent-token <token> --interval 8]
 #   bash setup.sh agent --intake-url <url> --agent-token <token> \
 #                        --interval 8 --wg-ip <wireguard_ip> \
 #                        --wg-hub <pubkey:endpoint,...>
+#
+# `lb` mode also installs the telemetry agent (same binary/unit/env vars as
+# agent mode) when --intake-url/--agent-token are provided, so LBs report
+# host/ports/procs/units like any other server (WS-6 "LB de corpo inteiro").
 #
 # Every step is idempotent: "se já existe, valida e segue" — re-running this
 # script (update, secret rotation, drift repair) must always be safe. No
@@ -469,6 +474,14 @@ step4_config_agent() {
         log "TODO: iptables-bootstrap.sh not found (checked --iptables-bootstrap, repo root, ../selfApi) — DNAT chain for blue-green must be provisioned manually or via --iptables-bootstrap=<path>"
     fi
 
+    write_agent_env
+}
+
+# Shared by agent mode's step 4 and lb mode's extra agent install: writes the
+# exact same env file the agent unit reads (EnvironmentFile= in
+# systemd/deployer-lb-agent.service), so an agent on an LB host is configured
+# identically to one on an app server.
+write_agent_env() {
     mkdir -p /etc/deployer-lb-agent
     umask 077
     cat > /etc/deployer-lb-agent/.env <<EOF
@@ -530,7 +543,12 @@ step6_validate_lb() {
 step6_validate_agent() {
     log "step 6/6: validation (handshake+ping, test POST)"
     validate_wg_peers
+    validate_agent_intake
+}
 
+# Signed test POST to the intake — shared by agent mode's step 6 and lb
+# mode's agent install (same HMAC scheme the agent binary itself uses).
+validate_agent_intake() {
     local ts body sig
     ts="$(date +%s)"
     body='{"test":true}'
@@ -552,6 +570,26 @@ step6_validate_agent() {
 }
 
 # ---------------------------------------------------------------------------
+# Extra step (lb mode) — telemetry agent on the LB host (WS-6)
+# ---------------------------------------------------------------------------
+#
+# LBs report host/ports/procs/units like any other server: install the agent
+# binary + env + unit exactly the way agent mode does (reusing its step
+# functions), skipping only the parts that don't apply to an LB host (docker
+# install, iptables DNAT bootstrap — there is no blue-green swap here).
+step_lb_agent() {
+    if [[ -z "$INTAKE_URL" || -z "$AGENT_TOKEN" ]]; then
+        log "extra step: telemetry agent NOT installed — pass --intake-url and --agent-token to make this LB report like any server (WS-6)"
+        return 0
+    fi
+    log "extra step: installing telemetry agent on this LB (reports like any server)"
+    step3_binary_agent
+    write_agent_env
+    step5_systemd_agent
+    validate_agent_intake
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -563,6 +601,7 @@ main() {
             step3_binary_lb
             step4_config_lb
             step5_systemd_lb
+            step_lb_agent
             step6_validate_lb
             ;;
         agent)
