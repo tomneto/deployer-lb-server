@@ -272,6 +272,35 @@ parse_peer_list() {
     done
 }
 
+# Emits [Peer] blocks from the union of $WG_PEERS (hub-style: spokes dialing
+# in, AllowedIPs=<ip>/32, no endpoint) and $WG_HUB (peer-style: hub(s) this
+# host dials out to, Endpoint + AllowedIPs=0.0.0.0/0 + PersistentKeepalive) —
+# whichever are non-empty. A dual-role host (registered as both server and
+# load_balancer) needs both sets in the same wg0.conf regardless of which
+# mode's setup.sh invocation actually writes the file (whichever runs first
+# wins, per wg_iface_configured() above — the other invocation only
+# validates). Single-role hosts are unaffected: the list that doesn't apply
+# to them is simply passed empty and this emits nothing for it.
+write_wg_peer_blocks() {
+    while IFS=: read -r pubkey ip; do
+        [[ -n "$pubkey" ]] || continue
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = ${pubkey}"
+        echo "AllowedIPs = ${ip}/32"
+    done < <(parse_peer_list "$WG_PEERS")
+
+    while IFS=: read -r pubkey endpoint; do
+        [[ -n "$pubkey" ]] || continue
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = ${pubkey}"
+        echo "Endpoint = ${endpoint}"
+        echo "AllowedIPs = 0.0.0.0/0"
+        echo "PersistentKeepalive = 25"
+    done < <(parse_peer_list "$WG_HUB")
+}
+
 step2_wireguard_lb() {
     log "step 2/6: WireGuard (hub mode)"
     ensure_wg_installed
@@ -290,13 +319,7 @@ step2_wireguard_lb() {
         echo "Address = ${WG_IP}/24"
         echo "ListenPort = ${WG_PORT}"
         echo "PrivateKey = $(cat /etc/wireguard/privatekey)"
-        while IFS=: read -r pubkey ip; do
-            [[ -n "$pubkey" ]] || continue
-            echo ""
-            echo "[Peer]"
-            echo "PublicKey = ${pubkey}"
-            echo "AllowedIPs = ${ip}/32"
-        done < <(parse_peer_list "$WG_PEERS")
+        write_wg_peer_blocks
     } > "$conf"
     chmod 600 "$conf"
 
@@ -321,15 +344,7 @@ step2_wireguard_agent() {
         echo "[Interface]"
         echo "Address = ${WG_IP}/24"
         echo "PrivateKey = $(cat /etc/wireguard/privatekey)"
-        while IFS=: read -r pubkey endpoint; do
-            [[ -n "$pubkey" ]] || continue
-            echo ""
-            echo "[Peer]"
-            echo "PublicKey = ${pubkey}"
-            echo "Endpoint = ${endpoint}"
-            echo "AllowedIPs = 0.0.0.0/0"
-            echo "PersistentKeepalive = 25"
-        done < <(parse_peer_list "$WG_HUB")
+        write_wg_peer_blocks
     } > "$conf"
     chmod 600 "$conf"
 
