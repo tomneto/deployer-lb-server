@@ -17,6 +17,7 @@ import (
 	"github.com/tomneto/deployer-lb-server/internal/auth"
 	"github.com/tomneto/deployer-lb-server/internal/nginx"
 	"github.com/tomneto/deployer-lb-server/internal/render"
+	"github.com/tomneto/deployer-lb-server/internal/version"
 )
 
 // Config wires the server's dependencies and policy knobs.
@@ -32,6 +33,12 @@ type Config struct {
 	Runner       nginx.Runner
 	Now          func() time.Time // injectable clock; defaults to time.Now
 	Logger       *log.Logger      // structured, append-only apply log (§2.3)
+
+	// Upstream health probing for GET /v1/status (C6): a plain TCP dial per
+	// upstream, cached so repeated status polls stay cheap.
+	HealthDialTimeout time.Duration                                                  // per-dial timeout; defaults to 1s
+	HealthCacheTTL    time.Duration                                                  // probe result reuse window; defaults to 10s
+	DialTimeout       func(network, addr string, timeout time.Duration) (net.Conn, error) // injectable dialer; defaults to net.DialTimeout
 }
 
 func (c *Config) setDefaults() {
@@ -128,7 +135,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "invalid"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
 }
 
 // ---- GET /v1/status (bearer required, no HMAC) ----
@@ -164,7 +171,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"apps": apps,
+		"apps":    apps,
+		"version": version.Version,
 		"nginx": map[string]any{
 			"running":   running,
 			"config_ok": configOk,

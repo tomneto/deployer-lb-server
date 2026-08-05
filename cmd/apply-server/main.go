@@ -13,6 +13,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/tomneto/deployer-lb-server/internal/lbserver"
 	"github.com/tomneto/deployer-lb-server/internal/nginx"
+	"github.com/tomneto/deployer-lb-server/internal/version"
 )
 
 func envOr(key, def string) string {
@@ -39,8 +41,17 @@ func main() {
 		maxBodyBytes = flag.Int64("max-body-bytes", 64*1024, "max accepted request body size in bytes")
 		tsWindow     = flag.Duration("ts-window", 30*time.Second, "allowed clock skew for X-Payload-Ts")
 		nonceTTL     = flag.Duration("nonce-ttl", 5*time.Minute, "how long nonces are remembered for replay protection")
+		showVerS     = flag.Bool("v", false, "print version and exit")
+		showVerL     = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	// Version check must exit before the required-flags validation so
+	// `deployer-lb-server -v` works on a host with no env configured.
+	if *showVerS || *showVerL {
+		fmt.Printf("deployer-lb-server %s\n", version.Version)
+		return
+	}
 
 	if *token == "" || *secret == "" {
 		log.Fatal("deployer-lb-server: --token and --secret (or LB_TOKEN / LB_SHARED_SECRET) are required")
@@ -63,7 +74,7 @@ func main() {
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 
-	logger.Printf("deployer-lb-server listening on %s (conf-dir=%s template=%s)", *addr, *confDir, *templatePath)
+	logger.Printf("deployer-lb-server %s listening on %s (conf-dir=%s template=%s)", version.Version, *addr, *confDir, *templatePath)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatalf("deployer-lb-server: %v", err)
 	}

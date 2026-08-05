@@ -228,7 +228,14 @@ download_or_build_binary() {
     log "GH release unavailable (expected until a release is published — TODO D10), building locally"
     have go || die "no GH release reachable and no local Go toolchain (go) to build ${name} from ${cmddir}"
     [[ -d "$REPO_ROOT/$cmddir" ]] || die "cannot build: $REPO_ROOT/$cmddir does not exist yet"
-    ( cd "$REPO_ROOT" && go build -tags "$tag" -o "$dest" "./$cmddir" )
+    # Stamp the build version so `<binary> -v` and the report/status payloads
+    # can identify what is installed. A future GH release pipeline (TODO D10)
+    # must inject the same ldflags.
+    local ver
+    ver="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
+    ( cd "$REPO_ROOT" && go build -tags "$tag" \
+        -ldflags "-X github.com/tomneto/deployer-lb-server/internal/version.Version=${ver}" \
+        -o "$dest" "./$cmddir" )
     echo "$dest"
 }
 
@@ -490,6 +497,9 @@ step5_systemd_lb() {
     fi
     systemctl daemon-reload
     systemctl enable --now deployer-lb-server.service
+    # enable --now is a no-op on an already-active unit; restart so a re-run
+    # of setup.sh actually swaps the running process to the new binary.
+    systemctl restart deployer-lb-server.service
 }
 
 step5_systemd_agent() {
@@ -497,6 +507,9 @@ step5_systemd_agent() {
     install -m 0644 "$REPO_ROOT/systemd/deployer-lb-agent.service" "$SYSTEMD_DIR/deployer-lb-agent.service"
     systemctl daemon-reload
     systemctl enable --now deployer-lb-agent.service
+    # enable --now is a no-op on an already-active unit; restart so a re-run
+    # of setup.sh actually swaps the running process to the new binary.
+    systemctl restart deployer-lb-agent.service
 }
 
 # ---------------------------------------------------------------------------

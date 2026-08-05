@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/tomneto/deployer-lb-server/internal/agent"
+	"github.com/tomneto/deployer-lb-server/internal/version"
 )
 
 func main() {
@@ -34,8 +36,17 @@ func main() {
 		mountsCSV   = flag.String("mounts", envOr("AGENT_MOUNTS", "/"), "comma-separated mount points to report disk usage for")
 		gitSHA      = flag.String("git-sha", envOr("GIT_SHA", ""), "optional build identifier reported in api.git_sha")
 		environment = flag.String("environment", envOr("ENVIRONMENT", "production"), "reported in api.environment")
+		showVerS    = flag.Bool("v", false, "print version and exit")
+		showVerL    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	// Version check must exit before the required-flags validation so
+	// `deployer-lb-agent -v` works on a host with no env configured.
+	if *showVerS || *showVerL {
+		fmt.Printf("deployer-lb-agent %s\n", version.Version)
+		return
+	}
 
 	if *intakeURL == "" || *agentID == "" || *agentToken == "" {
 		log.Fatal("deployer-lb-agent: --intake-url, --agent-id and --agent-token (or INTAKE_URL/AGENT_ID/AGENT_TOKEN env) are required")
@@ -62,7 +73,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("deployer-lb-agent starting: intake=%s agent_id=%s interval=%s", *intakeURL, *agentID, *interval)
+	log.Printf("deployer-lb-agent %s starting: intake=%s agent_id=%s interval=%s", version.Version, *intakeURL, *agentID, *interval)
 
 	runLoop(ctx, sender, loopConfig{
 		hostname:    hostname,
@@ -134,9 +145,10 @@ func tick(ctx context.Context, sender *agent.Sender, cfg loopConfig) {
 func buildReport(cfg loopConfig) agent.Report {
 	now := time.Now().UTC()
 	return agent.Report{
-		Timestamp: now.Format(time.RFC3339),
-		TargetID:  cfg.agentID,
-		Hostname:  cfg.hostname,
+		Timestamp:    now.Format(time.RFC3339),
+		TargetID:     cfg.agentID,
+		Hostname:     cfg.hostname,
+		AgentVersion: version.Version,
 		API: agent.APIInfo{
 			GitSHA:      cfg.gitSHA,
 			Environment: cfg.environment,

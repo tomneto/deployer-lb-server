@@ -14,9 +14,12 @@ package agent
 // use `configured: true` for its own error fallbacks — that's a different
 // code path documented in the plan as a deliberate asymmetry).
 type Report struct {
-	Timestamp string     `json:"timestamp"`
-	TargetID  string     `json:"target_id"`
-	Hostname  string     `json:"hostname"`
+	Timestamp string `json:"timestamp"`
+	TargetID  string `json:"target_id"`
+	Hostname  string `json:"hostname"`
+	// AgentVersion is the binary's own build version (git describe stamp),
+	// distinct from api.git_sha which identifies the deployed API build.
+	AgentVersion string     `json:"agent_version,omitempty"`
 	API       APIInfo    `json:"api"`
 	Server    ServerInfo `json:"server"`
 	Docker    DockerInfo `json:"docker"`
