@@ -1,0 +1,65 @@
+# Throwaway systemd-capable hosts for exercising setup.sh directly and
+# quickly during distro-support work (Ubuntu Server + Oracle Linux 9) —
+# same spirit as selfApi's docker-compose.ssh-test.yaml ("inspectable/
+# runnable standalone"), but running the REAL setup.sh (not a fake target):
+# systemctl/dnf/apt/wg-quick/nginx/docker all genuinely run inside these
+# containers. Not part of any CI job; not a substitute for validating
+# against a real host/VM before calling either distro done — only a fast
+# local loop while iterating.
+#
+# setup.sh is driven via `docker exec` (root, same as an elevated SSH
+# session), not real SSH — that plumbing is exercised separately against
+# selfApi's actual `provisioning.py` SSH flow.
+#
+# One-shot: scripts/test-provision.sh drives this file end to end (both
+# distros, asserts setup.sh's exit code) — that script IS the test suite for
+# this concern, and it is never invoked automatically (see its own header for
+# why). Manual/ad-hoc usage against this file directly:
+#
+#   docker compose -f docker-compose.provision-test.yaml up -d
+#   docker exec provision-test-ubuntu       systemctl is-system-running || true
+#   docker exec provision-test-oraclelinux  systemctl is-system-running || true
+#
+#   docker exec -it provision-test-ubuntu bash -lc \
+#     'cd /repo && bash setup.sh lb --wg-ip 10.10.9.1 --wg-port 51820'
+#   docker exec -it provision-test-oraclelinux bash -lc \
+#     'cd /repo && bash setup.sh lb --wg-ip 10.10.9.2 --wg-port 51820'
+#
+#   docker compose -f docker-compose.provision-test.yaml down -v
+services:
+  provision-test-ubuntu:
+    image: ubuntu:24.04
+    container_name: provision-test-ubuntu
+    privileged: true
+    cgroup: host
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - .:/repo:ro
+    # The base ubuntu image ships no init system — install systemd once,
+    # then exec it as PID 1 so systemctl/wg-quick@/nginx units behave
+    # exactly like they would on a real Ubuntu Server host.
+    command:
+      - /bin/bash
+      - -c
+      - |
+        apt-get update -y
+        apt-get install -y systemd systemd-sysv dbus iproute2 sudo
+        exec /sbin/init
+
+  provision-test-oraclelinux:
+    image: oraclelinux:9
+    container_name: provision-test-oraclelinux
+    privileged: true
+    cgroup: host
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - .:/repo:ro
+    # oraclelinux:9 (the full image, not -slim) already ships systemd —
+    # just needs to be PID 1 instead of the default /bin/bash.
+    command: ["/sbin/init"]

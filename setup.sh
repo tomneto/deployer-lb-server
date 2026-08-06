@@ -9,6 +9,7 @@
 #   bash setup.sh lb    --port <porta> --nginx-conf-dir /etc/nginx/conf.d \
 #                        --wg-ip <wireguard_ip> --wg-port <port> \
 #                        --wg-peers <pubkey:ip,...> \
+#                        [--lb-token <token> --lb-secret <secret>] \
 #                        [--intake-url <url> --agent-token <token> --interval 8]
 #   bash setup.sh agent --intake-url <url> --agent-token <token> \
 #                        --interval 8 --wg-ip <wireguard_ip> \
@@ -88,12 +89,42 @@ WG_PORT="51820"
 WG_PEERS=""   # lb: comma-separated pubkey:ip (peer allowed-ips it dials out to)
 WG_HUB=""     # agent: comma-separated pubkey:endpoint (hub(s) to peer with)
 
+LB_TOKEN=""
+LB_SECRET=""
+
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 
 log()  { printf '[setup.sh][%s] %s\n' "$MODE" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Distro detection (D-OS1) — informational + drives the RHEL-family-only
+# steps below (EPEL, firewalld, SELinux). The package-manager probes
+# (have apt-get/dnf/yum) remain the actual source of truth for which
+# installer to run; this only decides which *extra* prerequisites a `dnf`
+# host needs (Ubuntu never reaches those branches).
+# ---------------------------------------------------------------------------
+
+OS_ID="unknown"
+OS_ID_LIKE=""
+OS_VERSION_ID=""
+
+detect_os() {
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        OS_ID="${ID:-unknown}"
+        OS_ID_LIKE="${ID_LIKE:-}"
+        OS_VERSION_ID="${VERSION_ID:-}"
+    fi
+    local family="unknown"
+    have apt-get && family="debian"
+    have dnf && family="rhel"
+    have yum && [[ "$family" == "unknown" ]] && family="rhel"
+    log "detected distro: ${OS_ID} ${OS_VERSION_ID} (package family: ${family})"
+}
 
 # ---------------------------------------------------------------------------
 # Arg parsing (both modes share the parser; unknown flags for the current
@@ -104,6 +135,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port) LB_PORT="$2"; shift 2 ;;
         --nginx-conf-dir) NGINX_CONF_DIR="$2"; shift 2 ;;
+        --lb-token) LB_TOKEN="$2"; shift 2 ;;
+        --lb-secret) LB_SECRET="$2"; shift 2 ;;
         --intake-url) INTAKE_URL="$2"; shift 2 ;;
         --agent-id) AGENT_ID="$2"; shift 2 ;;
         --agent-token) AGENT_TOKEN="$2"; shift 2 ;;
@@ -142,11 +175,38 @@ wg_installed_version() {
     wg --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
 }
 
+# wireguard-tools (and, on Oracle Linux, nothing extra for nginx — it's a
+# plain AppStream package) is NOT in the base/AppStream repos of EL9: it
+# needs EPEL. Idempotent — safe to call before every dnf/yum install attempt.
+# Scoped to what we've actually confirmed: Oracle Linux has its own
+# EPEL-compatible channel already present-but-disabled on the image
+# (ol9_developer_EPEL); other dnf-based distros (Rocky/Alma/plain RHEL) fall
+# back to the upstream `epel-release` package. Never fatal — if neither path
+# applies (or the repo is already enabled) the subsequent package install is
+# what actually fails/succeeds, this is just best-effort repo setup.
+ensure_rhel_epel() {
+    have dnf || return 0
+    case "$OS_ID" in
+        ol)
+            local rel="${OS_VERSION_ID%%.*}"
+            dnf config-manager --set-enabled "ol${rel}_developer_EPEL" 2>/dev/null \
+                && log "enabled ol${rel}_developer_EPEL (Oracle Linux EPEL channel)" \
+                || log "warning: could not enable ol${rel}_developer_EPEL (may already be enabled, or dnf-plugins-core missing)"
+            ;;
+        rocky|almalinux|rhel|centos)
+            rpm -q epel-release >/dev/null 2>&1 \
+                || dnf install -y epel-release 2>/dev/null \
+                || log "warning: could not install epel-release for $OS_ID"
+            ;;
+    esac
+}
+
 install_or_upgrade_wireguard_tools() {
     if have apt-get; then
         apt-get update -y && apt-get install -y --only-upgrade wireguard-tools \
             || apt-get install -y wireguard-tools
     elif have dnf; then
+        ensure_rhel_epel
         dnf install -y wireguard-tools  # dnf install already upgrades in place
     elif have yum; then
         yum install -y wireguard-tools
@@ -208,13 +268,35 @@ step1_deps_lb() {
     have systemctl || die "systemd (systemctl) not found — required for both modes"
 }
 
+install_docker() {
+    # Primary path: Docker's own convenience script — same one-liner the
+    # selfApi orchestrator's ensure_docker() reuses (C8: "mesmo script,
+    # consistência"), so both callers install docker identically. On Oracle
+    # Linux this script sometimes fails to recognize the distro by name; the
+    # fallback below installs the official CentOS/RHEL docker-ce repo
+    # instead, which is binary-compatible with EL9/Oracle Linux.
+    log "docker not found, installing (official convenience script)"
+    if curl -fsSL https://get.docker.com | sh; then
+        return 0
+    fi
+    if have dnf; then
+        log "get.docker.com failed — falling back to docker-ce repo (centos/EL9-compatible)"
+        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo \
+            || die "could not add docker-ce repo"
+        dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+            || die "docker-ce install failed via dnf fallback repo"
+        systemctl enable --now docker
+        return 0
+    fi
+    die "docker install failed (get.docker.com) and no dnf fallback available on this distro"
+}
+
 step1_deps_agent() {
     log "step 1/6: dependencies (docker, wireguard-tools)"
     if have docker; then
         log "docker already installed, OK"
     else
-        log "docker not found, installing (official convenience script)"
-        curl -fsSL https://get.docker.com | sh
+        install_docker
     fi
 
     ensure_wireguard_tools_version
@@ -239,8 +321,19 @@ download_or_build_binary() {
     fi
 
     log "fetching binary: trying GH release first, falling back to local go build"
-    if curl -fsSL -o "$dest" "${GH_RELEASE_BASE_URL}/${name}" 2>/dev/null && [[ -s "$dest" ]]; then
-        log "downloaded ${name} from GH release"
+    # Release assets are published per-arch (name-linux-<goarch>, matching the
+    # cross-compile matrix repo_source.py already builds for): a single
+    # arch-less asset name would silently serve the wrong binary on a
+    # non-amd64 host.
+    local machine goarch
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64) goarch="amd64" ;;
+        aarch64|arm64) goarch="arm64" ;;
+        *) goarch="" ;;
+    esac
+    if [[ -n "$goarch" ]] && curl -fsSL -o "$dest" "${GH_RELEASE_BASE_URL}/${name}-linux-${goarch}" 2>/dev/null && [[ -s "$dest" ]]; then
+        log "downloaded ${name}-linux-${goarch} from GH release"
         chmod +x "$dest"
         echo "$dest"
         return 0
@@ -269,6 +362,40 @@ download_or_build_binary() {
 
 ensure_wg_installed() {
     have wg || die "wg (wireguard-tools) missing — step 1 should have installed it"
+}
+
+# Oracle Linux 9 ships firewalld active by default (unlike most Ubuntu cloud
+# images, which rely on the provider's security group instead) — without
+# this, nothing ever reaches the WireGuard hub or nginx on an OL9 LB. A
+# no-op everywhere firewalld isn't running, so it never fights a cloud
+# provider's own security group on Ubuntu.
+# $1 = port, $2 = protocol (tcp|udp)
+open_firewalld_port() {
+    have firewall-cmd || return 0
+    systemctl is-active --quiet firewalld || return 0
+    local port="$1" proto="$2"
+    if firewall-cmd --query-port="${port}/${proto}" >/dev/null 2>&1; then
+        return 0
+    fi
+    log "firewalld active — opening ${port}/${proto}"
+    firewall-cmd --permanent --add-port="${port}/${proto}" \
+        && firewall-cmd --reload \
+        || log "warning: could not open ${port}/${proto} on firewalld"
+}
+
+# SELinux is Enforcing by default on Oracle Linux 9. Best-effort baseline,
+# not an exhaustive AVC list — `ausearch -m avc` after a real run is how any
+# remaining denial gets found. No-op (and safe to call unconditionally) on
+# Ubuntu, where SELinux is normally absent.
+# $@ = paths to relabel (restorecon)
+ensure_selinux_compat() {
+    have getenforce || return 0
+    [[ "$(getenforce)" != "Disabled" ]] || return 0
+    log "SELinux active — applying best-effort compat${1:+ (relabeling $*)}"
+    have setsebool && setsebool -P httpd_can_network_connect on 2>/dev/null
+    if have restorecon && [[ $# -gt 0 ]]; then
+        restorecon -Rv "$@" >/dev/null 2>&1 || true
+    fi
 }
 
 ensure_wg_keypair() {
@@ -333,6 +460,9 @@ step2_wireguard_lb() {
     log "step 2/6: WireGuard (hub mode)"
     ensure_wg_installed
     ensure_wg_keypair
+    # Hub receives fresh handshakes from spokes — needs the port open inbound.
+    # An agent (spoke) never needs this: it only dials out to the hub.
+    open_firewalld_port "$WG_PORT" udp
 
     if wg_iface_configured; then
         log "interface $WG_IFACE already configured — validating only (not touching config)"
@@ -424,6 +554,7 @@ step3_binary_lb() {
     tmp="$(download_or_build_binary "deployer-lb-server" "lb" "cmd/apply-server")"
     install -m 0755 "$tmp" "${BIN_DIR}/deployer-lb-server"
     rm -f "$tmp"
+    ensure_selinux_compat "${BIN_DIR}/deployer-lb-server"
 }
 
 step3_binary_agent() {
@@ -432,11 +563,40 @@ step3_binary_agent() {
     tmp="$(download_or_build_binary "deployer-lb-agent" "agent" "cmd/agent")"
     install -m 0755 "$tmp" "${BIN_DIR}/deployer-lb-agent"
     rm -f "$tmp"
+    ensure_selinux_compat "${BIN_DIR}/deployer-lb-agent"
 }
 
 # ---------------------------------------------------------------------------
 # Step 4 — Config
 # ---------------------------------------------------------------------------
+
+# The env file deployer-lb-server.service reads (EnvironmentFile=-/etc/
+# deployer-lb-server/lb.env) for --addr/--conf-dir/--template/--token/
+# --secret — mirrors write_agent_env() below. Without this the unit starts
+# with all flags empty (pre-existing gap, unrelated to distro — fixed here
+# because step4_config_lb is already the step that owns these paths).
+#
+# --lb-token/--lb-secret are optional on this script: cmd/apply-server
+# requires them to even start (LB_TOKEN/LB_SHARED_SECRET), but the caller
+# (selfApi's provisioning.py) does not pass them yet — this writes whatever
+# it gets, empty or not, and warns loudly when they're missing rather than
+# silently leaving the LB unable to boot.
+write_lb_env() {
+    mkdir -p /etc/deployer-lb-server
+    umask 077
+    cat > /etc/deployer-lb-server/lb.env <<EOF
+LB_LISTEN_ADDR=${LB_PORT}
+NGINX_CONF_DIR=${NGINX_CONF_DIR}
+NGINX_TEMPLATE_PATH=${NGINX_TEMPLATE_DIR}/nginx-app.conf.tmpl
+LB_TOKEN=${LB_TOKEN}
+LB_SHARED_SECRET=${LB_SECRET}
+EOF
+    chmod 600 /etc/deployer-lb-server/lb.env
+    log "wrote /etc/deployer-lb-server/lb.env"
+    if [[ -z "$LB_TOKEN" || -z "$LB_SECRET" ]]; then
+        log "warning: --lb-token/--lb-secret not provided — deployer-lb-server will refuse to start (LB_TOKEN/LB_SHARED_SECRET required) until lb.env is filled in"
+    fi
+}
 
 step4_config_lb() {
     log "step 4/6: config (template, snippets, default_server catch-all)"
@@ -463,6 +623,11 @@ server {
 EOF
         log "wrote default_server catch-all at $default_conf"
     fi
+
+    write_lb_env
+    open_firewalld_port 80 tcp
+    open_firewalld_port 443 tcp
+    ensure_selinux_compat /etc/nginx "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR"
 
     nginx -t || die "nginx -t failed after installing template/snippets/catch-all"
 }
@@ -638,6 +803,7 @@ elevate_to_root() {
 
 main() {
     elevate_to_root
+    detect_os
     case "$MODE" in
         lb)
             step1_deps_lb
