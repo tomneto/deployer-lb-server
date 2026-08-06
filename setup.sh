@@ -38,6 +38,12 @@
 
 set -euo pipefail
 
+# Snapshot the original argv BEFORE MODE parsing advances/shifts $@ — the
+# self-elevation guard in elevate_to_root() needs the full original invocation
+# to re-exec, and by the time main() runs $@ has already been consumed by the
+# arg parser.
+SCRIPT_ARGS=("$@")
+
 # ---------------------------------------------------------------------------
 # Globals / defaults
 # ---------------------------------------------------------------------------
@@ -600,10 +606,38 @@ step_lb_agent() {
 }
 
 # ---------------------------------------------------------------------------
+# Root elevation
+# ---------------------------------------------------------------------------
+
+# setup.sh touches root-owned state (provisioning/nginx/systemd). It must not
+# silently run as a non-root user and die with an opaque "Operation not
+# permitted" mid-way — instead, when invoked as a normal user it transparently
+# re-executes itself through passwordless sudo (NOPASSWD), and fails up front
+# with actionable guidance when that isn't available. This is the belt-against-
+# suspenders guard for the central's preflight (selfApi provisioning.py, step
+# "ssh_provision"): the preflight catches plain non-root users before cloning,
+# this catches every other path (manual runs, drift repair, future callers).
+elevate_to_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        return 0
+    fi
+    if have sudo && sudo -n true 2>/dev/null; then
+        # We hold passwordless sudo and the current user isn't root — re-exec
+        # the exact same script as root, preserving the original argv (mode +
+        # flags) so the re-run lands directly in main() below.
+        log "not root — re-executing through passwordless sudo"
+        exec sudo -n bash "$0" "${SCRIPT_ARGS[@]}"
+        # exec never returns on success; if it does, fall through to die.
+    fi
+    die "this script needs root; the current user ($(id -un)) has no passwordless sudo (NOPASSWD). Register the target with a root SSH user or a passwordless-sudo user, or run this command manually as root."
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 main() {
+    elevate_to_root
     case "$MODE" in
         lb)
             step1_deps_lb
