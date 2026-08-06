@@ -222,6 +222,16 @@ download_or_build_binary() {
     local name="$1" tag="$2" cmddir="$3"
     local dest="/tmp/${name}.new"
 
+    # Prebuilt binary shipped inside the checkout (the backoffice orchestrator
+    # built it on the machine that had a Go toolchain — repo_source.py drops it
+    # under $REPO_ROOT/bin/). Prefer it: no GH release, no local go build.
+    local prebuilt="$REPO_ROOT/bin/$name"
+    if [[ -f "$prebuilt" ]]; then
+        log "using prebuilt binary shipped in checkout: $prebuilt"
+        echo "$prebuilt"
+        return 0
+    fi
+
     log "fetching binary: trying GH release first, falling back to local go build"
     if curl -fsSL -o "$dest" "${GH_RELEASE_BASE_URL}/${name}" 2>/dev/null && [[ -s "$dest" ]]; then
         log "downloaded ${name} from GH release"
