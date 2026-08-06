@@ -163,6 +163,10 @@ func buildReport(cfg loopConfig) agent.Report {
 	// cardinality filter (improves.md C3/WS-4).
 	ports := agent.CollectPorts()
 	docker := agent.CollectContainers(agent.ExecRunner)
+	// Image inventory (improves.md C6/WS-6) runs right after the containers:
+	// it needs their image digests to compute `in_use`. Read-only — no control
+	// action lives in the agent in this phase.
+	docker = docker.WithImages(agent.CollectImages(agent.ExecRunner, docker.Containers))
 	systemd := agent.CollectSystemd(agent.ExecRunner, cfg.managedPrefix, cfg.extraUnits)
 
 	pinned := append(ports.PortPIDs(), systemd.ManagedPIDs()...)

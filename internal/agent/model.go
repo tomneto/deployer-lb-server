@@ -109,15 +109,54 @@ type DockerInfo struct {
 	OK         bool        `json:"ok"`
 	Error      string      `json:"error,omitempty"`
 	Containers []Container `json:"containers"`
+	// Images/DiskUsage are the image inventory added by improves.md contract
+	// C6, collected by CollectImages and folded in by DockerInfo.WithImages.
+	// Both are `omitempty` on purpose: the pre-C6 intake keeps accepting the
+	// payload unchanged, and a host whose `docker images`/`docker system df`
+	// call failed simply omits the keys instead of sending empty sections.
+	Images    []Image    `json:"images,omitempty"`
+	DiskUsage *DiskUsage `json:"disk_usage,omitempty"`
+}
+
+// Image is one entry of the host's local image cache (C6 `docker.images[]`).
+// RepoTags mirrors `docker inspect`'s field of the same name — empty for a
+// dangling image. Size is in BYTES, parsed from docker's human-readable column
+// ("1.093GB"), matching the *_bytes convention of ServerInfo/DiskInfo. Created
+// is docker's CreatedAt string, reported verbatim (it is not RFC3339).
+type Image struct {
+	ID       string   `json:"id"`
+	RepoTags []string `json:"repo_tags"`
+	Size     uint64   `json:"size"`
+	Created  string   `json:"created"`
+	// InUse is computed by the agent by cross-referencing the container
+	// inventory (see markImagesInUse); it is what makes a prune decision
+	// possible on the backend side.
+	InUse bool `json:"in_use"`
+}
+
+// DiskUsage is the `docker system df` summary (C6 `docker.disk_usage`). All
+// values are BYTES; Reclaimable is the sum of the per-type reclaimable columns
+// (docker prints no grand total of its own).
+type DiskUsage struct {
+	Images      uint64 `json:"images"`
+	Containers  uint64 `json:"containers"`
+	Volumes     uint64 `json:"volumes"`
+	BuildCache  uint64 `json:"build_cache"`
+	Reclaimable uint64 `json:"reclaimable"`
 }
 
 type Container struct {
-	ID     string   `json:"id"`
-	Name   string   `json:"name"`
-	Image  string   `json:"image"`
-	State  string   `json:"state"`
-	Health string   `json:"health,omitempty"`
-	Ports  []string `json:"ports,omitempty"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Image string `json:"image"`
+	// ImageID is the image's config digest ("sha256:…"), from the top-level
+	// `Image` field of `docker inspect`. Distinct from Image above, which is
+	// Config.Image — the *tag the container was started with*. C6 joins the
+	// image inventory on this field, not on the tag.
+	ImageID string   `json:"image_id,omitempty"`
+	State   string   `json:"state"`
+	Health  string   `json:"health,omitempty"`
+	Ports   []string `json:"ports,omitempty"`
 	// Pid/StartedAt (C3): host PID of the container's init process and the
 	// RFC3339 start timestamp from `docker inspect` — they let the backend
 	// join containers against the ports/processes sections.

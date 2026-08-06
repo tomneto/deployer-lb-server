@@ -24,9 +24,14 @@ func ExecRunner(name string, args ...string) ([]byte, error) {
 // dockerInspectEntry mirrors only the fields of `docker inspect` output that
 // the report needs — the full schema is huge and versioned by Docker itself.
 type dockerInspectEntry struct {
-	ID     string `json:"Id"`
-	Name   string `json:"Name"`
-	Config struct {
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
+	// ImageID is the top-level `Image` of the inspect entry: the image's
+	// config digest ("sha256:…"). Config.Image below is a different thing —
+	// the tag the container was started with — and only the digest is a safe
+	// join key against the image inventory (C6/WS-6).
+	ImageID string `json:"Image"`
+	Config  struct {
 		Image string `json:"Image"`
 	} `json:"Config"`
 	State struct {
@@ -107,6 +112,7 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 			ID:        e.ID,
 			Name:      strings.TrimPrefix(e.Name, "/"),
 			Image:     e.Config.Image,
+			ImageID:   e.ImageID,
 			State:     e.State.Status,
 			Pid:       e.State.Pid,
 			StartedAt: e.State.StartedAt,

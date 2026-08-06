@@ -12,6 +12,7 @@ const fixtureInspectJSON = `[
   {
     "Id": "abc123",
     "Name": "/app-a",
+    "Image": "sha256:9b1c0a1f7e5d4c3b2a1908f7e6d5c4b3a29181706f5e4d3c2b1a09f8e7d6c5b4a",
     "Config": {"Image": "ghcr.io/tomneto/app-a:latest"},
     "State": {"Status": "running", "Health": {"Status": "healthy"}, "Pid": 3412, "StartedAt": "2026-08-04T11:22:33.123456789Z"},
     "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "10200"}]}}
@@ -36,6 +37,7 @@ func TestParseDockerInspect(t *testing.T) {
 			ID:        "abc123",
 			Name:      "app-a",
 			Image:     "ghcr.io/tomneto/app-a:latest",
+			ImageID:   "sha256:9b1c0a1f7e5d4c3b2a1908f7e6d5c4b3a29181706f5e4d3c2b1a09f8e7d6c5b4a",
 			State:     "running",
 			Health:    "healthy",
 			Ports:     []string{"0.0.0.0:10200->8080/tcp"},
