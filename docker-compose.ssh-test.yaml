@@ -1,0 +1,55 @@
+# Fake SSH target for tests/integration (agent_ssh_test.go, tag "integration")
+# — exercises the real `setup.sh agent` flow the way selfApi's provisioning.py
+# actually drives a target in production: SSH in as root, run setup.sh,
+# assert the systemd unit comes up and the agent starts reporting.
+#
+# Different from docker-compose.provision-test.yaml: that one drives setup.sh
+# via `docker exec` (no SSH transport involved) and is intentionally
+# manual-only/never-in-CI (see its own header). This fixture adds a real
+# sshd on top of the same systemd-capable Ubuntu image so the integration
+# test can dial in over actual SSH, same as production — heavier than
+# selfApi's plain alpine+sshd ssh-test fixture (no systemd needed there
+# because it fakes setup.sh entirely; here setup.sh must really run).
+#
+# Usage:
+#   docker compose -f docker-compose.ssh-test.yaml up -d --wait
+#   go test -tags integration ./tests/integration/... -v
+#   docker compose -f docker-compose.ssh-test.yaml down -v
+#
+# scripts/test-agent-ssh.sh drives this end to end — run that instead of the
+# raw commands above for the normal local loop.
+services:
+  agent-ssh-test:
+    image: ubuntu:24.04
+    container_name: deployer-lb-agent-ssh-test
+    privileged: true
+    cgroup: host
+    ports:
+      - "${SSH_TEST_PORT:-2222}:22"
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - .:/repo:ro
+    healthcheck:
+      test: ["CMD", "systemctl", "is-system-running"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        apt-get update -y
+        apt-get install -y systemd systemd-sysv dbus iproute2 sudo openssh-server golang-go
+        ssh-keygen -A
+        echo 'root:testpass123' | chpasswd
+        sed -i \
+          -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+          -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+          -e 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' \
+          /etc/ssh/sshd_config
+        systemctl enable ssh
+        exec /sbin/init
