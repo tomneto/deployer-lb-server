@@ -8,24 +8,37 @@
 // which is exactly what was missing when the frontend showed "não reporta
 // conexões de rede" / "Aguardando amostras…".
 //
-// Run via scripts/test-agent-ssh.sh, which brings up the fixture and tears
-// it down; see that script and docker-compose.ssh-test.yaml for the usage
-// this test assumes (fixture already up on $SSH_TEST_PORT, repo mounted
-// read-only at /repo inside the container).
+// Run via scripts/test-agent-ssh.sh, which by default brings up the local
+// docker-compose.ssh-test.yaml fixture and tears it down. To point this at
+// any other reachable SSH host instead (e.g. a real VM, when nested
+// virtualization can't create a real WireGuard interface), set
+// SSH_TEST_HOST (and SKIP_FIXTURE=1 on the script) plus whichever of
+// SSH_TEST_USER/SSH_TEST_PASSWORD/SSH_TEST_KEY/INTAKE_ADVERTISE_HOST don't
+// match that host's defaults — see envOr() below for the full list. No need
+// to pre-clone anything there either: unless REPO_REMOTE_PATH is set, this
+// test tars up the exact local checkout (uncommitted changes included) and
+// extracts it into a fresh remote temp dir over the same SSH connection,
+// cleaned up automatically when the test ends (see copyRepoToRemoteTemp).
 package integration
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,42 +46,212 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// Every one of these defaults matches docker-compose.ssh-test.yaml, so
+// running with no env vars at all still targets the local fixture exactly
+// as before. Set SSH_TEST_HOST (and optionally SSH_TEST_USER/_PASSWORD/_KEY,
+// REPO_REMOTE_PATH, INTAKE_ADVERTISE_HOST) to point the same test at any
+// real reachable SSH box instead — useful when the local Docker Desktop
+// VM can't create a real WireGuard interface (nested virtualization) but a
+// real host/VM can.
 const (
-	sshUser     = "root"
-	sshPassword = "testpass123"
-	agentToken  = "smoke-test-token"
-	agentID     = "agent-ssh-test"
+	agentToken = "smoke-test-token"
+	agentID    = "agent-ssh-test"
 )
 
-func sshPort(t *testing.T) string {
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func sshHost() string { return envOr("SSH_TEST_HOST", "127.0.0.1") }
+func sshPort() string { return envOr("SSH_TEST_PORT", "2222") }
+func sshUser() string { return envOr("SSH_TEST_USER", "root") }
+
+// resolveRepoRemotePath decides where setup.sh (and the rest of the
+// checkout) lives on the target. Three cases:
+//   - REPO_REMOTE_PATH set: use it verbatim — caller already put the repo
+//     there (or wants a specific path re-used across test runs).
+//   - Local docker fixture (SSH_TEST_HOST unset): "/repo", the read-only
+//     bind mount docker-compose.ssh-test.yaml already sets up.
+//   - Real external host (SSH_TEST_HOST set) with no REPO_REMOTE_PATH:
+//     tar up *this exact local checkout* — including any uncommitted
+//     changes, since that's usually the point of testing before a commit —
+//     and extract it into a fresh remote temp dir over the same SSH
+//     connection. No git clone/credentials on the remote host needed.
+func resolveRepoRemotePath(t *testing.T, client *ssh.Client) string {
 	t.Helper()
-	if p := os.Getenv("SSH_TEST_PORT"); p != "" {
+	if p := os.Getenv("REPO_REMOTE_PATH"); p != "" {
 		return p
 	}
-	return "2222"
+	if os.Getenv("SSH_TEST_HOST") == "" {
+		return "/repo"
+	}
+	return copyRepoToRemoteTemp(t, client)
+}
+
+// localRepoRoot walks up from this source file's own location to the repo
+// root (tests/integration/ -> repo root), so this works regardless of the
+// working directory `go test` happens to be invoked from.
+func localRepoRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("could not determine this source file's own path via runtime.Caller")
+	}
+	return filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+}
+
+// skipFromRepoTar excludes paths with no business being shipped to a throw-
+// away remote: .git (large, irrelevant to setup.sh) and any prebuilt bin/
+// (shipping one would defeat the very version-check test this package
+// exists to run — force download_or_build_binary() into its git-describe/
+// go-build path every time, deterministically).
+func skipFromRepoTar(relPath string) bool {
+	first := strings.SplitN(relPath, string(filepath.Separator), 2)[0]
+	return first == ".git" || first == "bin"
+}
+
+func copyRepoToRemoteTemp(t *testing.T, client *ssh.Client) string {
+	t.Helper()
+	localRoot := localRepoRoot(t)
+
+	mkdirOut, err := runRemote(t, client, "mktemp -d /tmp/deployer-lb-server.XXXXXX")
+	if err != nil {
+		t.Fatalf("mktemp -d on remote host: %v (%s)", err, mkdirOut)
+	}
+	remoteDir := strings.TrimSpace(mkdirOut)
+	t.Cleanup(func() {
+		_, _ = runRemote(t, client, fmt.Sprintf("rm -rf %s", remoteDir))
+	})
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("ssh new session for repo copy: %v", err)
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("ssh stdin pipe: %v", err)
+	}
+	var remoteOut strings.Builder
+	session.Stdout = &remoteOut
+	session.Stderr = &remoteOut
+
+	if err := session.Start(fmt.Sprintf("tar -xzf - -C %s", remoteDir)); err != nil {
+		t.Fatalf("start remote tar extract: %v", err)
+	}
+
+	gz := gzip.NewWriter(stdin)
+	tw := tar.NewWriter(gz)
+	walkErr := filepath.WalkDir(localRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(localRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if skipFromRepoTar(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+		if d.IsDir() {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if d.IsDir() || !info.Mode().IsRegular() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	closeErr1 := tw.Close()
+	closeErr2 := gz.Close()
+	closeErr3 := stdin.Close()
+	for _, e := range []error{walkErr, closeErr1, closeErr2, closeErr3} {
+		if e != nil {
+			t.Fatalf("streaming repo tar to remote host: %v", e)
+		}
+	}
+
+	if err := session.Wait(); err != nil {
+		t.Fatalf("remote tar extract failed: %v (%s)", err, remoteOut.String())
+	}
+	return remoteDir
+}
+
+func sshAuthMethod() (ssh.AuthMethod, error) {
+	if keyPath := os.Getenv("SSH_TEST_KEY"); keyPath != "" {
+		key, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read SSH_TEST_KEY %q: %w", keyPath, err)
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("parse SSH_TEST_KEY %q: %w", keyPath, err)
+		}
+		return ssh.PublicKeys(signer), nil
+	}
+	return ssh.Password(envOr("SSH_TEST_PASSWORD", "testpass123")), nil
 }
 
 func dialSSH(t *testing.T) *ssh.Client {
 	t.Helper()
+	auth, err := sshAuthMethod()
+	if err != nil {
+		t.Fatalf("build SSH auth method: %v", err)
+	}
 	cfg := &ssh.ClientConfig{
-		User:            sshUser,
-		Auth:            []ssh.AuthMethod{ssh.Password(sshPassword)},
+		User:            sshUser(),
+		Auth:            []ssh.AuthMethod{auth},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
 	}
-	addr := net.JoinHostPort("127.0.0.1", sshPort(t))
+	addr := net.JoinHostPort(sshHost(), sshPort())
 
+	// The docker fixture's boot command apt-get installs systemd/sshd/
+	// golang-go/git from scratch (docker-compose.ssh-test.yaml) before
+	// systemd ever starts sshd — on a first pull with no apt cache this
+	// alone can take several minutes, and docker's port-forwarding proxy
+	// will happily accept a raw TCP connect (and then reset it) long before
+	// anything real is listening behind it, so a short deadline here just
+	// produces a misleading "connection reset" instead of a real timeout.
+	// A real external target (SSH_TEST_HOST set) is normally ready
+	// immediately, but the same generous deadline is harmless there too.
 	var client *ssh.Client
-	var err error
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
 		client, err = ssh.Dial("tcp", addr, cfg)
 		if err == nil {
 			return client
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
-	t.Fatalf("could not SSH into fixture at %s after 60s: %v", addr, err)
+	t.Fatalf("could not SSH into %s after 5min: %v", addr, err)
 	return nil
 }
 
@@ -84,16 +267,22 @@ func runRemote(t *testing.T, client *ssh.Client, cmd string) (string, error) {
 	return string(out), err
 }
 
-// dockerBridgeGateway resolves the address the container's default route
-// uses to reach the host — the fake intake httptest server runs in this
-// test process on the host, and the container needs to reach it without
-// docker-compose port publishing (which would round-trip through the OS
-// network stack for no benefit here).
-func dockerBridgeGateway(t *testing.T, client *ssh.Client) string {
+// intakeAdvertiseHost resolves the address the SSH target should use to
+// reach back to this test process's fake intake (an httptest.Server running
+// right here). For the docker fixture that's the container's default route
+// gateway (the host, from the container's point of view) — auto-detected.
+// A real external target can't be auto-detected the same way (its default
+// route goes to a real router, not back to your machine), so set
+// INTAKE_ADVERTISE_HOST to whatever address that target can use to reach
+// this machine (a WireGuard/VPN IP, a LAN IP, etc).
+func intakeAdvertiseHost(t *testing.T, client *ssh.Client) string {
 	t.Helper()
+	if h := os.Getenv("INTAKE_ADVERTISE_HOST"); h != "" {
+		return h
+	}
 	out, err := runRemote(t, client, "ip route | awk '/default/ {print $3}'")
 	if err != nil {
-		t.Fatalf("resolve docker bridge gateway: %v (%s)", err, out)
+		t.Fatalf("resolve default-route gateway (set INTAKE_ADVERTISE_HOST to skip this auto-detection): %v (%s)", err, out)
 	}
 	gw := ""
 	for _, line := range splitLines(out) {
@@ -102,7 +291,7 @@ func dockerBridgeGateway(t *testing.T, client *ssh.Client) string {
 		}
 	}
 	if gw == "" {
-		t.Fatalf("could not resolve docker bridge gateway from route output: %q", out)
+		t.Fatalf("could not resolve default-route gateway from route output (set INTAKE_ADVERTISE_HOST instead): %q", out)
 	}
 	return gw
 }
@@ -208,12 +397,17 @@ func TestSetupAgent_RunsOverSSHAndReportsConnectionsAndDiskIO(t *testing.T) {
 	intake := newFakeIntake()
 	defer intake.close()
 
-	gw := dockerBridgeGateway(t, client)
+	repoPath := resolveRepoRemotePath(t, client)
+	gw := intakeAdvertiseHost(t, client)
 	intakeURL := fmt.Sprintf("http://%s/infra/agent/report", net.JoinHostPort(gw, intake.port()))
 
+	// Wrapped in `timeout` so a stalled network call inside setup.sh (its
+	// curl calls now carry --max-time, but this is a second line of
+	// defense) fails fast with a clear error instead of silently eating
+	// the whole go test -timeout budget with no output to show why.
 	cmd := fmt.Sprintf(
-		"cd /repo && AGENT_INTERVAL=3 bash setup.sh agent --intake-url %s --agent-token %s --wg-ip 10.10.9.9",
-		intakeURL, agentToken,
+		"cd %s && timeout 240 env AGENT_INTERVAL=3 bash setup.sh agent --intake-url %s --agent-token %s --wg-ip 10.10.9.9",
+		repoPath, intakeURL, agentToken,
 	)
 	out, err := runRemote(t, client, cmd)
 	if err != nil {
@@ -268,11 +462,12 @@ func TestSetupAgent_RejectsStalePrebuiltBinary(t *testing.T) {
 	client := dialSSH(t)
 	defer client.Close()
 
-	// /repo is read-only (docker-compose.ssh-test.yaml), and the script
-	// needs to create a throwaway git repo under mktemp — that part works
-	// fine against a read-only checkout since it only reads setup.sh out
-	// of it and writes everything else under /tmp.
-	out, err := runRemote(t, client, "bash /repo/scripts/test-download-or-build-binary.sh")
+	repoPath := resolveRepoRemotePath(t, client)
+	// The docker fixture's /repo is read-only, and the script needs to
+	// create a throwaway git repo under mktemp — that part works fine
+	// against a read-only checkout since it only reads setup.sh out of it
+	// and writes everything else under /tmp.
+	out, err := runRemote(t, client, fmt.Sprintf("bash %s/scripts/test-download-or-build-binary.sh", repoPath))
 	if err != nil {
 		t.Fatalf("scripts/test-download-or-build-binary.sh failed over SSH: %v\n--- output ---\n%s", err, out)
 	}

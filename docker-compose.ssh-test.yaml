@@ -43,7 +43,7 @@ services:
       - |
         set -e
         apt-get update -y
-        apt-get install -y systemd systemd-sysv dbus iproute2 sudo openssh-server golang-go
+        apt-get install -y systemd systemd-sysv dbus iproute2 sudo openssh-server golang-go git curl ca-certificates openssl
         ssh-keygen -A
         echo 'root:testpass123' | chpasswd
         sed -i \

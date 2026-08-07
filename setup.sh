@@ -207,8 +207,13 @@ ensure_rhel_epel() {
 
 install_or_upgrade_wireguard_tools() {
     if have apt-get; then
-        apt-get update -y && apt-get install -y --only-upgrade wireguard-tools \
-            || apt-get install -y wireguard-tools
+        # `install --only-upgrade` on a package that isn't installed yet
+        # prints "Skipping ..." and exits 0 — not an error — so the `||
+        # apt-get install` fallback below never ran and a host with no
+        # wireguard-tools at all silently kept none installed. Plain
+        # `apt-get install` already upgrades an existing package to the
+        # newest available version, so it covers both cases on its own.
+        apt-get update -y && apt-get install -y wireguard-tools
     elif have dnf; then
         ensure_rhel_epel
         dnf install -y wireguard-tools  # dnf install already upgrades in place
@@ -345,7 +350,7 @@ download_or_build_binary() {
         aarch64|arm64) goarch="arm64" ;;
         *) goarch="" ;;
     esac
-    if [[ -n "$goarch" ]] && curl -fsSL -o "$dest" "${GH_RELEASE_BASE_URL}/${name}-linux-${goarch}" 2>/dev/null && [[ -s "$dest" ]]; then
+    if [[ -n "$goarch" ]] && curl -fsSL --connect-timeout 10 --max-time 30 -o "$dest" "${GH_RELEASE_BASE_URL}/${name}-linux-${goarch}" 2>/dev/null && [[ -s "$dest" ]]; then
         log "downloaded ${name}-linux-${goarch} from GH release"
         chmod +x "$dest"
         echo "$dest"
@@ -755,7 +760,7 @@ validate_agent_intake() {
     body='{"test":true}'
     if have openssl; then
         sig="$(printf '%s%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$AGENT_TOKEN" | awk '{print $NF}')"
-        if curl -fsS -X POST "$INTAKE_URL" \
+        if curl -fsS --connect-timeout 5 --max-time 15 -X POST "$INTAKE_URL" \
             -H "Content-Type: application/json" \
             -H "X-Agent-Id: ${AGENT_ID}" \
             -H "X-Agent-Ts: ${ts}" \
