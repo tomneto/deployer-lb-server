@@ -57,6 +57,69 @@ func TestParseDockerInspect(t *testing.T) {
 	}
 }
 
+func TestParseExposedPorts(t *testing.T) {
+	cases := []struct {
+		name string
+		in   map[string]struct{}
+		want []int
+	}{
+		{
+			// Protocol is dropped and ports are sorted: the consumer joins these
+			// against the services/listeners view, which is keyed by port.
+			name: "sorted, protocol stripped",
+			in:   map[string]struct{}{"8080/tcp": {}, "53/udp": {}, "443/tcp": {}},
+			want: []int{53, 443, 8080},
+		},
+		{
+			// tcp and udp on the same port are one port here.
+			name: "deduplicated across protocols",
+			in:   map[string]struct{}{"53/tcp": {}, "53/udp": {}},
+			want: []int{53},
+		},
+		{
+			// nil (not an empty slice) so `omitempty` keeps the key out of the
+			// payload for a container that exposes nothing.
+			name: "nothing exposed is nil",
+			in:   map[string]struct{}{},
+			want: nil,
+		},
+		{
+			name: "unparseable specs are skipped",
+			in:   map[string]struct{}{"notaport/tcp": {}, "0/tcp": {}, "9000/tcp": {}},
+			want: []int{9000},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := parseExposedPorts(c.in); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("parseExposedPorts() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseDockerInspect_ReadsExposedPorts(t *testing.T) {
+	// An exposed port that was never published: NetworkSettings.Ports is empty,
+	// so only Config.ExposedPorts records that the image offers 9000.
+	raw := []byte(`[{
+	  "Id": "abc123", "Name": "/worker",
+	  "Config": {"Image": "worker:1", "ExposedPorts": {"9000/tcp": {}, "9001/tcp": {}}},
+	  "State": {"Status": "running"},
+	  "NetworkSettings": {"Ports": {}}
+	}]`)
+
+	got, err := ParseDockerInspect(raw)
+	if err != nil {
+		t.Fatalf("ParseDockerInspect() error = %v", err)
+	}
+	if want := []int{9000, 9001}; !reflect.DeepEqual(got[0].ExposedPorts, want) {
+		t.Errorf("ExposedPorts = %v, want %v", got[0].ExposedPorts, want)
+	}
+	if len(got[0].Ports) != 0 {
+		t.Errorf("Ports = %v, want empty (nothing published)", got[0].Ports)
+	}
+}
+
 func TestParseDockerInspect_InvalidJSON(t *testing.T) {
 	if _, err := ParseDockerInspect([]byte("not json")); err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")

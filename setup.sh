@@ -80,6 +80,10 @@ INTAKE_URL=""
 AGENT_ID="$(hostname -f 2>/dev/null || hostname)"
 AGENT_TOKEN=""
 AGENT_INTERVAL="8"
+# 1 = collect per-container stats (see write_agent_env). Overridable from the
+# environment so a re-run of setup.sh on a busy host can turn it off without a
+# new flag.
+AGENT_DOCKER_STATS="${AGENT_DOCKER_STATS:-1}"
 IPTABLES_BOOTSTRAP_SCRIPT="${IPTABLES_BOOTSTRAP_SCRIPT:-}"
 
 # shared wireguard options
@@ -672,6 +676,13 @@ AGENT_TOKEN=${AGENT_TOKEN}
 AGENT_INTERVAL=${AGENT_INTERVAL}s
 AGENT_WG_IFACE=${WG_IFACE}
 AGENT_BUFFER_DIR=/var/lib/deployer-lb-agent/buffer
+# Per-container CPU/mem/net/blkio, via \`docker stats --no-stream\`. Written
+# explicitly (rather than left to the binary's default of 1) so the knob is
+# visible to whoever has to tune this host: it is the only expensive call in a
+# report tick — it blocks ~1s and scales with the container count. Set to 0 on a
+# host with dozens of containers where it competes with AGENT_INTERVAL; the
+# report then ships the container inventory without usage numbers.
+AGENT_DOCKER_STATS=${AGENT_DOCKER_STATS}
 EOF
     chmod 600 /etc/deployer-lb-agent/.env
     log "wrote /etc/deployer-lb-agent/.env (mode 600, not in any repo)"

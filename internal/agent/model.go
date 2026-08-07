@@ -33,6 +33,64 @@ type Report struct {
 	Ports     PortsInfo     `json:"ports"`
 	Processes ProcessesInfo `json:"processes"`
 	Systemd   SystemdInfo   `json:"systemd"`
+	// DiskIO/Connections close the parity gap with the central's own local
+	// collectors (selfApi infra.host_disk_io / connections_summary), so a
+	// remote host renders the same Overview/Rede/Armazenamento cards as the
+	// local one. Additive: an intake that predates them ignores the keys, and
+	// an OLD agent simply doesn't send them — the backend must treat both
+	// sections as optional.
+	DiskIO      DiskIOInfo      `json:"disk_io"`
+	Connections ConnectionsInfo `json:"connections"`
+}
+
+// DiskIOInfo carries per-device block I/O counters. Values are CUMULATIVE
+// since boot — the same convention as ServerInfo.Network — and the backend
+// derives read/s and write/s between consecutive reports
+// (infra_agents.compute_disk_io_rates). Reporting rates here instead would
+// mean two different derivations for the same number (WS risk 3).
+type DiskIOInfo struct {
+	OK      bool         `json:"ok"`
+	Error   string       `json:"error,omitempty"`
+	Devices []DiskDevice `json:"devices,omitempty"`
+}
+
+// DiskDevice is one whole physical disk. Partitions and device-mapper
+// pseudo-devices are filtered out (see filterDiskDevices) so the same I/O is
+// never counted twice under two names.
+type DiskDevice struct {
+	Device     string `json:"device"`
+	ReadBytes  uint64 `json:"read_bytes"`
+	WriteBytes uint64 `json:"write_bytes"`
+	ReadCount  uint64 `json:"read_count"`
+	WriteCount uint64 `json:"write_count"`
+	IoTimeMs   uint64 `json:"io_time_ms"`
+}
+
+// ConnectionsInfo is the socket census: AGGREGATE COUNTS ONLY. A busy host has
+// tens of thousands of sockets and the full listing would dwarf the rest of
+// the report — TopPorts is the bounded drill-down that answers "who is being
+// hit" without shipping every tuple.
+//
+// Inbound/outbound follow the central's own classification
+// (infra._classify_connections): an ESTABLISHED socket whose LOCAL port is one
+// we also listen on is inbound (someone dialed us); anything else established
+// is outbound (we dialed out).
+type ConnectionsInfo struct {
+	OK          bool        `json:"ok"`
+	Error       string      `json:"error,omitempty"`
+	Established uint32      `json:"established"`
+	Inbound     uint32      `json:"inbound"`
+	Outbound    uint32      `json:"outbound"`
+	Listening   uint32      `json:"listening"`
+	TimeWait    uint32      `json:"time_wait"`
+	TopPorts    []PortCount `json:"top_ports,omitempty"`
+}
+
+// PortCount is one entry of ConnectionsInfo.TopPorts: a listening local port
+// and how many established sockets currently land on it.
+type PortCount struct {
+	Port        uint32 `json:"port"`
+	Connections uint32 `json:"connections"`
 }
 
 // APIInfo carries build/environment identification. v1 of the agent has no
@@ -162,6 +220,50 @@ type Container struct {
 	// join containers against the ports/processes sections.
 	Pid       int32  `json:"pid,omitempty"`
 	StartedAt string `json:"started_at,omitempty"`
+	// Per-container resource usage, matching the field names the central's own
+	// local collector already publishes (selfApi infra.py `docker.containers[]`)
+	// so the frontend's ContainersSection/ServerHero read one dialect. Filled by
+	// DockerInfo.WithStats from `docker stats --no-stream`; all `omitempty`
+	// because that call is optional (AGENT_DOCKER_STATS=0) and may time out.
+	//
+	// CPUPercent/MemPercent/MemUsage/MemLimit are INSTANTANEOUS readings, while
+	// Net*/Disk* are CUMULATIVE totals for the container's lifetime — the
+	// backend derives per-container rates from consecutive reports
+	// (infra_agents.compute_container_io_rates).
+	CPUPercent     float64 `json:"cpu_percent,omitempty"`
+	MemUsage       uint64  `json:"mem_usage,omitempty"`
+	MemLimit       uint64  `json:"mem_limit,omitempty"`
+	MemPercent     float64 `json:"mem_percent,omitempty"`
+	NetRxBytes     uint64  `json:"net_rx_bytes,omitempty"`
+	NetTxBytes     uint64  `json:"net_tx_bytes,omitempty"`
+	DiskReadBytes  uint64  `json:"disk_read_bytes,omitempty"`
+	DiskWriteBytes uint64  `json:"disk_write_bytes,omitempty"`
+	// ExposedPorts are the container-side ports declared by the image
+	// (`Config.ExposedPorts`), regardless of whether they were published to the
+	// host — Ports above only describes the published bindings.
+	ExposedPorts []int `json:"exposed_ports,omitempty"`
+}
+
+// ContainerStats is one `docker stats` row, keyed by container ID in the map
+// CollectStats returns. Separate from Container so the stats pass can fail
+// wholesale without touching the inventory.
+type ContainerStats struct {
+	CPUPercent     float64
+	MemUsage       uint64
+	MemLimit       uint64
+	MemPercent     float64
+	NetRxBytes     uint64
+	NetTxBytes     uint64
+	DiskReadBytes  uint64
+	DiskWriteBytes uint64
+}
+
+// StatsInfo is the result of the whole `docker stats` pass: the per-container
+// rows plus one ok/error pair, folded into the report by DockerInfo.WithStats.
+type StatsInfo struct {
+	OK    bool
+	Error string
+	Stats map[string]ContainerStats
 }
 
 // WGInfo is the WireGuard peer health, per D21: it feeds the "wireguard"

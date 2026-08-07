@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,8 +41,15 @@ func main() {
 		// get the detailed `systemctl show` pass in the report.
 		managedPrefix = flag.String("managed-prefix", envOr("AGENT_MANAGED_PREFIX", agent.DefaultManagedPrefix), "systemd unit-name prefix considered deployer-managed (detailed reporting)")
 		unitsCSV      = flag.String("units", envOr("AGENT_UNITS", ""), "comma-separated extra systemd units to report in detail (\".service\" suffix optional)")
-		showVerS      = flag.Bool("v", false, "print version and exit")
-		showVerL      = flag.Bool("version", false, "print version and exit")
+		// `docker stats --no-stream` is the only expensive call in a tick: it
+		// blocks ~1s and scales with the container count. On by default (the
+		// per-container CPU/mem/net/blkio it yields is what makes a remote host
+		// render the same cards as the local one), with an escape hatch for
+		// hosts where it competes with the report interval.
+		dockerStats      = flag.Bool("docker-stats", envBoolOr("AGENT_DOCKER_STATS", true), "collect per-container stats via `docker stats --no-stream` (expensive on hosts with many containers)")
+		dockerStatsLimit = flag.Duration("docker-stats-timeout", envDurationOr("AGENT_DOCKER_STATS_TIMEOUT", 5*time.Second), "hard deadline for the `docker stats` call; past it the report ships without per-container stats")
+		showVerS         = flag.Bool("v", false, "print version and exit")
+		showVerL         = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -89,6 +97,8 @@ func main() {
 		interval:      *interval,
 		managedPrefix: *managedPrefix,
 		extraUnits:    splitCSV(*unitsCSV),
+		dockerStats:   *dockerStats,
+		statsTimeout:  *dockerStatsLimit,
 		// One process-handle cache for the whole agent lifetime: gopsutil
 		// needs two samples on the same handle for a real cpu_percent, so the
 		// cache must survive across ticks (improves.md WS-4).
@@ -109,6 +119,8 @@ type loopConfig struct {
 	managedPrefix string
 	extraUnits    []string
 	procCache     *agent.ProcCache
+	dockerStats   bool
+	statsTimeout  time.Duration
 }
 
 // runLoop is the core periodic loop, deliberately free of package-level
@@ -161,12 +173,22 @@ func buildReport(cfg loopConfig) agent.Report {
 	// Ports, docker and systemd run first: their PIDs (port owners, container
 	// init PIDs, managed-unit MainPIDs) pin entries in the processes
 	// cardinality filter (improves.md C3/WS-4).
-	ports := agent.CollectPorts()
+	//
+	// Ports and connections come out of ONE socket scan: they are two
+	// projections of the same /proc/net walk, and doing it twice per tick on a
+	// host with tens of thousands of sockets is pure waste.
+	ports, connections := agent.CollectSockets()
 	docker := agent.CollectContainers(agent.ExecRunner)
 	// Image inventory (improves.md C6/WS-6) runs right after the containers:
 	// it needs their image digests to compute `in_use`. Read-only — no control
 	// action lives in the agent in this phase.
 	docker = docker.WithImages(agent.CollectImages(agent.ExecRunner, docker.Containers))
+	// Per-container usage, last of the docker passes and the only one under a
+	// deadline: if `docker stats` overruns, the report ships with the inventory
+	// and without the numbers rather than arriving late.
+	if cfg.dockerStats {
+		docker = docker.WithStats(agent.CollectStats(agent.TimeoutRunner(cfg.statsTimeout)))
+	}
 	systemd := agent.CollectSystemd(agent.ExecRunner, cfg.managedPrefix, cfg.extraUnits)
 
 	pinned := append(ports.PortPIDs(), systemd.ManagedPIDs()...)
@@ -189,6 +211,26 @@ func buildReport(cfg loopConfig) agent.Report {
 		Ports:     ports,
 		Processes: cfg.procCache.CollectProcesses(pinned),
 		Systemd:   systemd,
+		// Host-level disk I/O and the socket census: the two sections the
+		// central used to have only for its own host, which is what kept the
+		// remote server view from rendering the same Overview/Rede cards.
+		DiskIO:      agent.CollectDiskIO(),
+		Connections: connections,
+	}
+}
+
+// envBoolOr reads a boolean env var accepting the spellings ops actually write
+// in a unit file: 1/0, true/false, yes/no, on/off. Anything unrecognized falls
+// back rather than failing startup — a typo in an optional tuning knob must not
+// stop a host from reporting.
+func envBoolOr(key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
 	}
 }
 

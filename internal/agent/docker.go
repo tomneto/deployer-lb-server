@@ -3,11 +3,14 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Runner executes an external command and returns combined stdout. It is the
@@ -19,6 +22,20 @@ type Runner func(name string, args ...string) ([]byte, error)
 func ExecRunner(name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
 	return cmd.Output()
+}
+
+// TimeoutRunner is ExecRunner with a hard deadline, for the one docker call
+// whose duration is not bounded by anything the agent controls
+// (`docker stats --no-stream` samples every container's cgroup twice). Past the
+// deadline the child is killed and the caller gets an error — which every
+// collector folds into an ok:false section — so a slow docker daemon costs a
+// missing section, never a late or skipped report.
+func TimeoutRunner(d time.Duration) Runner {
+	return func(name string, args ...string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		return exec.CommandContext(ctx, name, args...).Output()
+	}
 }
 
 // dockerInspectEntry mirrors only the fields of `docker inspect` output that
@@ -33,6 +50,11 @@ type dockerInspectEntry struct {
 	ImageID string `json:"Image"`
 	Config  struct {
 		Image string `json:"Image"`
+		// ExposedPorts is the image's declared container-side ports, keyed
+		// "8080/tcp" with an empty-object value. Distinct from
+		// NetworkSettings.Ports below, which only describes what was actually
+		// PUBLISHED to the host — a container can expose a port nobody mapped.
+		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	} `json:"Config"`
 	State struct {
 		Status string `json:"Status"`
@@ -120,6 +142,7 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 		if e.State.Health != nil {
 			c.Health = e.State.Health.Status
 		}
+		c.ExposedPorts = parseExposedPorts(e.Config.ExposedPorts)
 
 		containerPorts := make([]string, 0, len(e.NetworkSettings.Ports))
 		for containerPort := range e.NetworkSettings.Ports {
@@ -140,6 +163,33 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// parseExposedPorts turns docker's `Config.ExposedPorts` keys ("8080/tcp",
+// "53/udp") into bare port numbers, sorted ascending for a stable report. The
+// protocol is dropped on purpose: the consumer joins these against the
+// listeners/services view, which is keyed by port. Returns nil (not an empty
+// slice) when nothing is exposed, so the field stays out of the JSON entirely.
+func parseExposedPorts(raw map[string]struct{}) []int {
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := map[int]bool{}
+	out := make([]int, 0, len(raw))
+	for spec := range raw {
+		portStr, _, _ := strings.Cut(spec, "/")
+		port, err := strconv.Atoi(strings.TrimSpace(portStr))
+		if err != nil || port <= 0 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		out = append(out, port)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Ints(out)
+	return out
 }
 
 // ContainerPIDs returns the unique host PIDs of the running containers, used

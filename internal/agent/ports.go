@@ -36,7 +36,18 @@ func collectPorts(
 	if err != nil {
 		return PortsInfo{OK: false, Error: "net connections: " + err.Error(), Listeners: []Listener{}}
 	}
+	return portsFromConns(conns, nameFor, userFor)
+}
 
+// portsFromConns projects an already-fetched socket census onto the `ports`
+// section. Split out from collectPorts so CollectSockets can derive both the
+// ports and the connections sections from a single scan instead of walking
+// every socket twice per tick.
+func portsFromConns(
+	conns []gonet.ConnectionStat,
+	nameFor func(pid int32) string,
+	userFor func(uid int32) string,
+) PortsInfo {
 	type key struct {
 		proto string
 		addr  string
