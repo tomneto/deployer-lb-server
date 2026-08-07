@@ -316,12 +316,21 @@ download_or_build_binary() {
 
     # Prebuilt binary shipped inside the checkout (the backoffice orchestrator
     # built it on the machine that had a Go toolchain — repo_source.py drops it
-    # under $REPO_ROOT/bin/). Prefer it: no GH release, no local go build.
+    # under $REPO_ROOT/bin/). Prefer it, but only when its stamped version
+    # matches this checkout — otherwise repo_source.py dropped it before a
+    # `git pull` and "update agent" would silently reinstall a stale binary
+    # (no rebuild, no version check) even though the source has moved on.
     local prebuilt="$REPO_ROOT/bin/$name"
     if [[ -f "$prebuilt" ]]; then
-        log "using prebuilt binary shipped in checkout: $prebuilt"
-        echo "$prebuilt"
-        return 0
+        local checkout_ver prebuilt_ver
+        checkout_ver="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
+        prebuilt_ver="$("$prebuilt" -v 2>/dev/null | awk '{print $2}')"
+        if [[ "$prebuilt_ver" == "$checkout_ver" ]]; then
+            log "using prebuilt binary shipped in checkout: $prebuilt (version $prebuilt_ver)"
+            echo "$prebuilt"
+            return 0
+        fi
+        log "prebuilt binary $prebuilt is stale (version '$prebuilt_ver', checkout is '$checkout_ver') — ignoring it"
     fi
 
     log "fetching binary: trying GH release first, falling back to local go build"
