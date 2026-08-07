@@ -4,12 +4,21 @@
 # assert the systemd unit comes up and the agent starts reporting.
 #
 # Different from docker-compose.provision-test.yaml: that one drives setup.sh
-# via `docker exec` (no SSH transport involved) and is intentionally
-# manual-only/never-in-CI (see its own header). This fixture adds a real
+# via `docker exec` (no SSH transport involved). This fixture adds a real
 # sshd on top of the same systemd-capable Ubuntu image so the integration
 # test can dial in over actual SSH, same as production — heavier than
 # selfApi's plain alpine+sshd ssh-test fixture (no systemd needed there
 # because it fakes setup.sh entirely; here setup.sh must really run).
+#
+# Manual-only, same as docker-compose.provision-test.yaml, and for the same
+# reason: confirmed by an actual failed run that `privileged`/cgroup-mounted
+# systemd doesn't come up reliably on GitHub-hosted runners (release.yml
+# tried gating on this once and the job failed in ~2 minutes, well before
+# any of the test's own timeouts — not a hang, an environment limitation).
+# Run this locally before cutting a release instead; see
+# tests/integration/agent_ssh_test.go's header for pointing it at a real
+# SSH host if the local nested-virtualization limitations bite there too
+# (e.g. WireGuard interface creation inside Docker Desktop's WSL2 VM).
 #
 # Usage:
 #   docker compose -f docker-compose.ssh-test.yaml up -d --wait

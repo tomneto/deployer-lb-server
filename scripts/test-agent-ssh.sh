@@ -6,8 +6,12 @@
 # in production: SSH in as root, run setup.sh, confirm the resulting agent
 # reports land on an intake with connections/disk_io/agent_version present.
 #
-# This is the "run this locally before touching GitHub Actions" loop; the
-# same commands are what the release.yml `integration-test` job runs.
+# Manual-only, same as scripts/test-provision.sh and for the same reason:
+# a real run confirmed `privileged`/cgroup-mounted systemd doesn't come up
+# reliably on GitHub-hosted runners (failed in ~2min, well short of any of
+# this test's own timeouts — an environment limitation, not a hang). Run
+# this before cutting a release; it is intentionally NOT wired into
+# release.yml.
 #
 # Usage:
 #   bash scripts/test-agent-ssh.sh            # bring up local fixture, test, tear down

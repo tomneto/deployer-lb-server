@@ -18,26 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  integration-test:
-    # Drives setup.sh's real agent flow over real SSH against
-    # docker-compose.ssh-test.yaml (systemd + sshd, unprivileged concerns
-    # aside — this DOES need --privileged/cgroup for systemd, unlike
-    # selfApi's plain-alpine ssh-test fixture; validate this job is stable
-    # on hosted runners before relying on it as a hard release gate long
-    # term — see docker-compose.ssh-test.yaml's header for the known risk).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Run agent SSH integration tests
-        run: bash scripts/test-agent-ssh.sh
-
   build:
-    needs: integration-test
     runs-on: ubuntu-latest
     strategy:
       matrix:
