@@ -84,6 +84,19 @@ type ConnectionsInfo struct {
 	Listening   uint32      `json:"listening"`
 	TimeWait    uint32      `json:"time_wait"`
 	TopPorts    []PortCount `json:"top_ports,omitempty"`
+	// Conns is a bounded (maxConnEntries) sample of established sockets, the
+	// per-connection counterpart of the aggregate counts above — the backend
+	// forwards it verbatim as `snapshot.connections` for the frontend's
+	// "Conexões (entrada/saída)" list.
+	Conns []ConnEntry `json:"connections,omitempty"`
+}
+
+// ConnEntry is one established socket: which side dialed (Direction, same
+// classification as Inbound/Outbound above) and the two endpoints.
+type ConnEntry struct {
+	Direction string `json:"direction"` // "inbound" | "outbound"
+	Remote    string `json:"remote"`
+	Local     string `json:"local"`
 }
 
 // PortCount is one entry of ConnectionsInfo.TopPorts: a listening local port
@@ -318,8 +331,21 @@ type ProcInfo struct {
 	User       string  `json:"user,omitempty"`
 	CPUPercent float64 `json:"cpu_percent"`
 	RSSBytes   uint64  `json:"rss_bytes"`
-	CreateTime int64   `json:"create_time"` // unix seconds
-	Status     string  `json:"status"`      // one-letter ps state (R/S/D/Z/T/I/...)
+	// MemPercent is RSS as a percentage of host total memory (gopsutil
+	// Process.MemoryPercent), the per-process counterpart of ServerInfo's
+	// host-wide Memory.UsedPercent.
+	MemPercent float64 `json:"mem_percent"`
+	// ReadRateBps/WriteRateBps are bytes/sec derived between consecutive
+	// report ticks from the process's cumulative IOCounters, the same
+	// since-last-report convention CPUPercent already uses.
+	ReadRateBps  float64 `json:"read_rate_bps"`
+	WriteRateBps float64 `json:"write_rate_bps"`
+	// Connections is the count of established sockets owned by this PID
+	// (from the same socket scan CollectSockets already does for the
+	// `connections`/`ports` sections — no extra syscalls here).
+	Connections int    `json:"connections"`
+	CreateTime  int64  `json:"create_time"` // unix seconds
+	Status      string `json:"status"`      // one-letter ps state (R/S/D/Z/T/I/...)
 }
 
 // SystemdInfo is the systemd inventory (C3 `systemd`): a light listing of ALL

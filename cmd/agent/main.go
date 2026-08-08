@@ -177,7 +177,7 @@ func buildReport(cfg loopConfig) agent.Report {
 	// Ports and connections come out of ONE socket scan: they are two
 	// projections of the same /proc/net walk, and doing it twice per tick on a
 	// host with tens of thousands of sockets is pure waste.
-	ports, connections := agent.CollectSockets()
+	ports, connections, pidConns := agent.CollectSockets()
 	docker := agent.CollectContainers(agent.ExecRunner)
 	// Image inventory (improves.md C6/WS-6) runs right after the containers:
 	// it needs their image digests to compute `in_use`. Read-only — no control
@@ -209,7 +209,7 @@ func buildReport(cfg loopConfig) agent.Report {
 		Vercel:    agent.ConfigFlag{Configured: false},
 		N8N:       agent.ConfigFlag{Configured: false},
 		Ports:     ports,
-		Processes: cfg.procCache.CollectProcesses(pinned),
+		Processes: cfg.procCache.CollectProcesses(pinned, pidConns),
 		Systemd:   systemd,
 		// Host-level disk I/O and the socket census: the two sections the
 		// central used to have only for its own host, which is what kept the

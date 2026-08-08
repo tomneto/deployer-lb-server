@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"fmt"
 	"sort"
 	"syscall"
 
@@ -23,6 +24,10 @@ const (
 // full socket list is deliberately never sent (a busy host has tens of
 // thousands of sockets and this payload goes out every 8 seconds).
 const maxTopPorts = 10
+
+// How many established sockets ride in ConnectionsInfo.Conns — same
+// reasoning as maxTopPorts: the frontend only ever renders a handful of rows.
+const maxConnEntries = 50
 
 // classifyConnections is the pure core of CollectConnections: it turns a socket
 // census into aggregate counts. Kept parameter-free of syscalls so the
@@ -46,6 +51,7 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 
 	info := ConnectionsInfo{OK: true}
 	perPort := map[uint32]uint32{}
+	var entries []ConnEntry
 	for _, c := range conns {
 		switch {
 		case c.Status == tcpListen:
@@ -54,12 +60,19 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 			info.TimeWait++
 		case c.Status == tcpEstablished:
 			info.Established++
+			direction := "outbound"
 			if listeningPorts[c.Laddr.Port] {
 				info.Inbound++
 				perPort[c.Laddr.Port]++
+				direction = "inbound"
 			} else {
 				info.Outbound++
 			}
+			entries = append(entries, ConnEntry{
+				Direction: direction,
+				Remote:    fmt.Sprintf("%s:%d", c.Raddr.IP, c.Raddr.Port),
+				Local:     fmt.Sprintf("%s:%d", c.Laddr.IP, c.Laddr.Port),
+			})
 		case c.Type == syscall.SOCK_DGRAM && c.Raddr.Port == 0:
 			info.Listening++
 		}
@@ -83,7 +96,29 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 	if len(top) > 0 {
 		info.TopPorts = top
 	}
+
+	// Deterministic order (remote endpoint), same reasoning as TopPorts.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Remote < entries[j].Remote })
+	if len(entries) > maxConnEntries {
+		entries = entries[:maxConnEntries]
+	}
+	if len(entries) > 0 {
+		info.Conns = entries
+	}
 	return info
+}
+
+// connCountsByPid tallies established sockets per owning PID from the same
+// socket census classifyConnections uses, so CollectProcesses can fill
+// ProcInfo.Connections without a second /proc/net scan.
+func connCountsByPid(conns []gonet.ConnectionStat) map[int32]int {
+	counts := map[int32]int{}
+	for _, c := range conns {
+		if c.Status == tcpEstablished && c.Pid > 0 {
+			counts[c.Pid]++
+		}
+	}
+	return counts
 }
 
 // CollectConnections reports the aggregate socket census (report section
@@ -101,16 +136,18 @@ func CollectConnections() ConnectionsInfo {
 	return classifyConnections(conns)
 }
 
-// CollectSockets derives both socket-derived sections from ONE scan of the
+// CollectSockets derives all socket-derived sections from ONE scan of the
 // host's inet sockets. The scan is the expensive part (gopsutil walks
-// /proc/net/{tcp,tcp6,udp,udp6} and, for ports, the owning PIDs); the two
-// projections over it are cheap.
-func CollectSockets() (PortsInfo, ConnectionsInfo) {
+// /proc/net/{tcp,tcp6,udp,udp6} and, for ports, the owning PIDs); the
+// projections over it are cheap. pidConns is per-PID established-connection
+// counts, folded into ProcInfo.Connections by CollectProcesses.
+func CollectSockets() (PortsInfo, ConnectionsInfo, map[int32]int) {
 	conns, err := gonet.Connections("inet")
 	if err != nil {
 		msg := "net connections: " + err.Error()
 		return PortsInfo{OK: false, Error: msg, Listeners: []Listener{}},
-			ConnectionsInfo{OK: false, Error: msg}
+			ConnectionsInfo{OK: false, Error: msg},
+			nil
 	}
-	return portsFromConns(conns, processName, uidUsername), classifyConnections(conns)
+	return portsFromConns(conns, processName, uidUsername), classifyConnections(conns), connCountsByPid(conns)
 }

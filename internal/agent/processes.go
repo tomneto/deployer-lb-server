@@ -5,6 +5,7 @@ package agent
 import (
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -28,10 +29,24 @@ const (
 // collection.
 type ProcCache struct {
 	handles map[int32]*process.Process
+	// ioPrev mirrors handles' reuse-across-ticks discipline for disk I/O:
+	// gopsutil's IOCounters returns CUMULATIVE bytes, so a rate needs a prior
+	// sample to diff against, the same "since previous report" convention
+	// CPUPercent gets for free from gopsutil.
+	ioPrev map[int32]procIOSample
+}
+
+// procIOSample is the previous tick's cumulative IO counters for one PID,
+// timestamped so the rate can be computed regardless of the actual tick
+// interval.
+type procIOSample struct {
+	at    time.Time
+	read  uint64
+	write uint64
 }
 
 func NewProcCache() *ProcCache {
-	return &ProcCache{handles: map[int32]*process.Process{}}
+	return &ProcCache{handles: map[int32]*process.Process{}, ioPrev: map[int32]procIOSample{}}
 }
 
 // procCandidate is one sampled process, the input of the pure selection
@@ -48,12 +63,15 @@ type procCandidate struct {
 // top-15 by CPU and top-15 by RSS, hard-capped at 60 entries with a
 // `truncated` flag. Best-effort like every collector: a listing failure
 // yields {OK:false, Error:...}; per-process field failures leave zero values.
-func (c *ProcCache) CollectProcesses(pinnedPIDs []int32) ProcessesInfo {
+func (c *ProcCache) CollectProcesses(pinnedPIDs []int32, pidConns map[int32]int) ProcessesInfo {
 	if c == nil {
 		// Nil receiver still works (one-shot sampling, cpu_percent will read
 		// as since-process-start on the first report) — best-effort over
 		// panicking in the report loop.
 		c = NewProcCache()
+	}
+	if c.ioPrev == nil {
+		c.ioPrev = map[int32]procIOSample{}
 	}
 	procs, err := process.Processes()
 	if err != nil {
@@ -96,6 +114,9 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32) ProcessesInfo {
 		byPid[cand.pid] = cand
 	}
 
+	now := time.Now()
+	newIOPrev := make(map[int32]procIOSample, len(selected))
+
 	out := make([]ProcInfo, 0, len(selected))
 	for _, pid := range selected {
 		h := alive[pid]
@@ -103,9 +124,22 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32) ProcessesInfo {
 			continue
 		}
 		info := ProcInfo{
-			Pid:        pid,
-			CPUPercent: byPid[pid].cpu,
-			RSSBytes:   byPid[pid].rss,
+			Pid:         pid,
+			CPUPercent:  byPid[pid].cpu,
+			RSSBytes:    byPid[pid].rss,
+			Connections: pidConns[pid],
+		}
+		if mp, err := h.MemoryPercent(); err == nil {
+			info.MemPercent = float64(mp)
+		}
+		if io, err := h.IOCounters(); err == nil && io != nil {
+			newIOPrev[pid] = procIOSample{at: now, read: io.ReadBytes, write: io.WriteBytes}
+			if prev, ok := c.ioPrev[pid]; ok {
+				if elapsed := now.Sub(prev.at).Seconds(); elapsed > 0 {
+					info.ReadRateBps = rateOrZero(io.ReadBytes, prev.read, elapsed)
+					info.WriteRateBps = rateOrZero(io.WriteBytes, prev.write, elapsed)
+				}
+			}
 		}
 		if ppid, err := h.Ppid(); err == nil {
 			info.Ppid = ppid
@@ -127,8 +161,21 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32) ProcessesInfo {
 		}
 		out = append(out, info)
 	}
+	c.ioPrev = newIOPrev
 
 	return ProcessesInfo{OK: true, Truncated: truncated, Procs: out}
+}
+
+// rateOrZero is the IO-counter analogue of a CPU delta: cur/prev are
+// cumulative byte counts, elapsed is the seconds between samples. A negative
+// delta (pid reuse landing a same-numbered but different process, or a
+// counter reset) clamps to 0 rather than reporting a nonsensical negative
+// rate.
+func rateOrZero(cur, prev uint64, elapsed float64) float64 {
+	if cur < prev {
+		return 0
+	}
+	return float64(cur-prev) / elapsed
 }
 
 // selectProcs is the pure cardinality filter (C3): union of pinned PIDs,

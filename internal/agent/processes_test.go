@@ -178,7 +178,7 @@ func TestCollectProcesses_NilCacheAndSelfPresence(t *testing.T) {
 	// Real-collection smoke test: the test process itself must be sampleable
 	// and a nil receiver must not panic (best-effort guarantee).
 	var cache *ProcCache
-	info := cache.CollectProcesses(nil)
+	info := cache.CollectProcesses(nil, nil)
 	if !info.OK {
 		t.Fatalf("expected OK=true, got error %q", info.Error)
 	}
@@ -197,12 +197,12 @@ func TestCollectProcesses_NilCacheAndSelfPresence(t *testing.T) {
 
 func TestProcCache_InvalidatesDeadPIDs(t *testing.T) {
 	cache := NewProcCache()
-	if info := cache.CollectProcesses(nil); !info.OK {
+	if info := cache.CollectProcesses(nil, nil); !info.OK {
 		t.Fatalf("first collection failed: %q", info.Error)
 	}
 	// Poison the cache with an impossible PID; the next collection must drop it.
 	cache.handles[1<<30] = nil
-	if info := cache.CollectProcesses(nil); !info.OK {
+	if info := cache.CollectProcesses(nil, nil); !info.OK {
 		t.Fatalf("second collection failed: %q", info.Error)
 	}
 	if _, ok := cache.handles[1<<30]; ok {
