@@ -277,6 +277,43 @@ step1_deps_lb() {
     have systemctl || die "systemd (systemctl) not found — required for both modes"
 }
 
+# Small/free-tier VMs (the common target for this script) can have as
+# little as 1GB RAM and no swap at all, which is enough to get the docker-ce
+# dnf transaction (docker-ce + containerd.io + buildx/compose plugins,
+# resolved against every enabled repo's metadata) OOM-killed outright — dnf
+# gives no error text in that case, just `Killed` from the shell, and
+# there's no dnf-level workaround (disabling repos/weak-deps still isn't
+# guaranteed to fit). A temporary swapfile is the robust fix: cheap, safe,
+# idempotent (no-ops if swap already exists or memory is already ample), and
+# left in place afterward since the same headroom helps every future package
+# install/update on this host, not just this one run.
+ensure_swap() {
+    have swapon || return 0  # no swap support on this system, nothing to do
+    local total_kb avail_kb swap_kb
+    total_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+    swap_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+    # Only step in below ~2GB RAM with no existing swap — anything above
+    # that comfortably fits the docker-ce transaction without help.
+    if (( total_kb >= 2 * 1024 * 1024 )) || (( swap_kb > 0 )); then
+        return 0
+    fi
+    avail_kb="$(df -Pk / | awk 'NR==2{print $4}')"
+    if (( avail_kb < 2 * 1024 * 1024 )); then
+        log "warning: low RAM (${total_kb}kB) and <2GB free disk — skipping swapfile creation"
+        return 0
+    fi
+    log "low RAM (${total_kb}kB) and no swap — creating 2G swapfile at /swapfile"
+    if fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null; then
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null \
+            && swapon /swapfile \
+            && grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+        log "swapfile active: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"
+    else
+        log "warning: could not create /swapfile — proceeding without extra swap"
+    fi
+}
+
 install_docker() {
     # Primary path: Docker's own convenience script — same one-liner the
     # selfApi orchestrator's ensure_docker() reuses (C8: "mesmo script,
@@ -290,6 +327,7 @@ install_docker() {
     fi
     if have dnf; then
         log "get.docker.com failed — falling back to docker-ce repo (centos/EL9-compatible)"
+        ensure_swap
         dnf config-manager --help >/dev/null 2>&1 \
             || dnf install -y dnf-plugins-core 2>/dev/null \
             || log "warning: could not install dnf-plugins-core (may already be present)"
