@@ -89,6 +89,15 @@ IPTABLES_BOOTSTRAP_SCRIPT="${IPTABLES_BOOTSTRAP_SCRIPT:-}"
 # separately-triggered step (selfApi's docker_setup.ensure_docker via SSH)
 # instead of bundled into the monolithic agent provisioning run.
 SKIP_DOCKER=0
+# 1 = force install_docker even when probe_resources() finds RAM below
+# DOCKER_MIN_RAM_MB — the operator's explicit override of the auto-skip below.
+WITH_DOCKER=0
+# Below this, step1_deps_agent auto-skips docker (same log-and-move-on
+# behavior as --skip-docker) unless --with-docker forces it. Keeps a plain
+# `setup.sh agent` run (no selfApi in the loop passing --skip-docker) from
+# OOM-killing itself on a small VM by default — not just when selfApi
+# already knows to ask for it.
+DOCKER_MIN_RAM_MB=1536
 
 # shared wireguard options
 WG_IFACE="wg0"
@@ -114,6 +123,24 @@ mem_snapshot() {
     awk '/^MemTotal:/{t=$2} /^SwapTotal:/{s=$2} /^MemAvailable:/{a=$2}
          END{printf "RAM=%dMB swap=%dMB avail=%dMB", t/1024, s/1024, a/1024}' \
         /proc/meminfo
+}
+
+RAM_TOTAL_MB=0
+
+# Detected once, right after elevate_to_root/detect_os in main() — before any
+# dependency-installing step — so the decision of what to install (docker,
+# below) is resource-aware from the very first step, not an afterthought.
+# Emits one grep-able stderr line, same pattern as ensure_wg_keypair's
+# "WireGuard public key: " — selfApi's provisioning.py parses it out of the
+# log_tail the exact same way it already captures the WireGuard pubkey, and
+# persists it on the target document.
+probe_resources() {
+    local ram_mb cpu_cores disk_free_mb
+    ram_mb="$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)"
+    cpu_cores="$(nproc 2>/dev/null || echo 1)"
+    disk_free_mb="$(df -Pk / | awk 'NR==2{printf "%d", $4/1024}')"
+    RAM_TOTAL_MB="$ram_mb"
+    log "System resources: ram_mb=${ram_mb} cpu_cores=${cpu_cores} disk_free_mb=${disk_free_mb}"
 }
 
 # ---------------------------------------------------------------------------
@@ -165,9 +192,12 @@ while [[ $# -gt 0 ]]; do
         --wg-hub) WG_HUB="$2"; shift 2 ;;
         --iptables-bootstrap) IPTABLES_BOOTSTRAP_SCRIPT="$2"; shift 2 ;;
         --skip-docker) SKIP_DOCKER=1; shift ;;
+        --with-docker) WITH_DOCKER=1; shift ;;
         *) die "unknown flag: $1" ;;
     esac
 done
+
+(( SKIP_DOCKER && WITH_DOCKER )) && die "--skip-docker and --with-docker are mutually exclusive"
 
 if [[ "$MODE" == "lb" ]]; then
     [[ -n "$WG_IP" ]] || die "--wg-ip is required for mode lb"
@@ -405,6 +435,8 @@ step1_deps_agent() {
     log "step 1/6: dependencies (docker, wireguard-tools)"
     if (( SKIP_DOCKER )); then
         log "--skip-docker set — leaving docker install to a separate step (or skipping if this target won't run docker-runtime pipelines)"
+    elif (( !WITH_DOCKER && RAM_TOTAL_MB > 0 && RAM_TOTAL_MB < DOCKER_MIN_RAM_MB )); then
+        log "auto-skipping docker install: ${RAM_TOTAL_MB}MB RAM is below the ${DOCKER_MIN_RAM_MB}MB floor for a safe docker-ce install — the core (WireGuard + Go agent + systemd) is what makes this host controllable, docker can be installed separately later (pass --with-docker to force it now)"
     elif have docker; then
         log "docker already installed, OK"
     else
@@ -934,6 +966,7 @@ elevate_to_root() {
 main() {
     elevate_to_root
     detect_os
+    probe_resources
     case "$MODE" in
         lb)
             step1_deps_lb
