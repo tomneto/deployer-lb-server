@@ -15,7 +15,8 @@ const (
 	// chars") so a single java/node invocation can't bloat the report.
 	maxCmdlineLen = 200
 	// topNProcs is how many processes are kept per resource dimension
-	// (top-N by CPU and top-N by RSS) in the cardinality filter.
+	// (top-N by CPU, RSS, disk I/O rate and connection count) in the
+	// cardinality filter.
 	topNProcs = 15
 	// maxProcs is the hard cap of the `processes.procs` list.
 	maxProcs = 60
@@ -52,9 +53,11 @@ func NewProcCache() *ProcCache {
 // procCandidate is one sampled process, the input of the pure selection
 // filter (kept minimal so tests can build fixtures without gopsutil).
 type procCandidate struct {
-	pid int32
-	cpu float64
-	rss uint64
+	pid    int32
+	cpu    float64
+	rss    uint64
+	ioRate float64
+	conns  int
 }
 
 // CollectProcesses samples all processes and returns the C3 `processes`
@@ -95,17 +98,33 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32, pidConns map[int32]int)
 		pinned[pid] = true
 	}
 
+	now := time.Now()
+	newIOPrev := make(map[int32]procIOSample, len(alive))
+	ioRates := make(map[int32][2]float64, len(alive))
+
 	candidates := make([]procCandidate, 0, len(alive))
 	for pid, h := range alive {
-		cand := procCandidate{pid: pid}
+		cand := procCandidate{pid: pid, conns: pidConns[pid]}
 		if cpu, err := h.CPUPercent(); err == nil {
 			cand.cpu = cpu
 		}
 		if mi, err := h.MemoryInfo(); err == nil && mi != nil {
 			cand.rss = mi.RSS
 		}
+		if io, err := h.IOCounters(); err == nil && io != nil {
+			newIOPrev[pid] = procIOSample{at: now, read: io.ReadBytes, write: io.WriteBytes}
+			if prev, ok := c.ioPrev[pid]; ok {
+				if elapsed := now.Sub(prev.at).Seconds(); elapsed > 0 {
+					readRate := rateOrZero(io.ReadBytes, prev.read, elapsed)
+					writeRate := rateOrZero(io.WriteBytes, prev.write, elapsed)
+					ioRates[pid] = [2]float64{readRate, writeRate}
+					cand.ioRate = readRate + writeRate
+				}
+			}
+		}
 		candidates = append(candidates, cand)
 	}
+	c.ioPrev = newIOPrev
 
 	selected, truncated := selectProcs(candidates, pinned, topNProcs, maxProcs)
 
@@ -113,9 +132,6 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32, pidConns map[int32]int)
 	for _, cand := range candidates {
 		byPid[cand.pid] = cand
 	}
-
-	now := time.Now()
-	newIOPrev := make(map[int32]procIOSample, len(selected))
 
 	out := make([]ProcInfo, 0, len(selected))
 	for _, pid := range selected {
@@ -132,14 +148,9 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32, pidConns map[int32]int)
 		if mp, err := h.MemoryPercent(); err == nil {
 			info.MemPercent = float64(mp)
 		}
-		if io, err := h.IOCounters(); err == nil && io != nil {
-			newIOPrev[pid] = procIOSample{at: now, read: io.ReadBytes, write: io.WriteBytes}
-			if prev, ok := c.ioPrev[pid]; ok {
-				if elapsed := now.Sub(prev.at).Seconds(); elapsed > 0 {
-					info.ReadRateBps = rateOrZero(io.ReadBytes, prev.read, elapsed)
-					info.WriteRateBps = rateOrZero(io.WriteBytes, prev.write, elapsed)
-				}
-			}
+		if rates, ok := ioRates[pid]; ok {
+			info.ReadRateBps = rates[0]
+			info.WriteRateBps = rates[1]
 		}
 		if ppid, err := h.Ppid(); err == nil {
 			info.Ppid = ppid
@@ -161,7 +172,6 @@ func (c *ProcCache) CollectProcesses(pinnedPIDs []int32, pidConns map[int32]int)
 		}
 		out = append(out, info)
 	}
-	c.ioPrev = newIOPrev
 
 	return ProcessesInfo{OK: true, Truncated: truncated, Procs: out}
 }
@@ -179,9 +189,11 @@ func rateOrZero(cur, prev uint64, elapsed float64) float64 {
 }
 
 // selectProcs is the pure cardinality filter (C3): union of pinned PIDs,
-// top-N by CPU and top-N by RSS, capped at max entries. When the cap drops
-// candidates, truncated=true. Pinned PIDs win over top-CPU which wins over
-// top-RSS; the returned slice is sorted by PID for a stable report shape.
+// top-N by CPU, top-N by RSS, top-N by disk I/O rate and top-N by connection
+// count, capped at max entries. When the cap drops candidates,
+// truncated=true. Priority when the cap bites is pinned, then top-CPU, then
+// top-RSS, then top-IO, then top-connections; the returned slice is sorted
+// by PID for a stable report shape.
 func selectProcs(cands []procCandidate, pinned map[int32]bool, topN, max int) ([]int32, bool) {
 	exists := make(map[int32]bool, len(cands))
 	for _, cand := range cands {
@@ -228,6 +240,41 @@ func selectProcs(cands []procCandidate, pinned map[int32]bool, topN, max int) ([
 	})
 	for i := 0; i < topN && i < len(byRSS); i++ {
 		add(byRSS[i].pid)
+	}
+
+	// IO and connections are sparse dimensions (most processes sit at zero),
+	// so unlike CPU/RSS a zero-value tie is not a meaningful "top" entry —
+	// only candidates with actual activity are eligible.
+	byIO := make([]procCandidate, 0, len(cands))
+	for _, cand := range cands {
+		if cand.ioRate > 0 {
+			byIO = append(byIO, cand)
+		}
+	}
+	sort.Slice(byIO, func(i, j int) bool {
+		if byIO[i].ioRate != byIO[j].ioRate {
+			return byIO[i].ioRate > byIO[j].ioRate
+		}
+		return byIO[i].pid < byIO[j].pid
+	})
+	for i := 0; i < topN && i < len(byIO); i++ {
+		add(byIO[i].pid)
+	}
+
+	byConns := make([]procCandidate, 0, len(cands))
+	for _, cand := range cands {
+		if cand.conns > 0 {
+			byConns = append(byConns, cand)
+		}
+	}
+	sort.Slice(byConns, func(i, j int) bool {
+		if byConns[i].conns != byConns[j].conns {
+			return byConns[i].conns > byConns[j].conns
+		}
+		return byConns[i].pid < byConns[j].pid
+	})
+	for i := 0; i < topN && i < len(byConns); i++ {
+		add(byConns[i].pid)
 	}
 
 	truncated := false

@@ -290,10 +290,12 @@ install_docker() {
     fi
     if have dnf; then
         log "get.docker.com failed — falling back to docker-ce repo (centos/EL9-compatible)"
+        dnf install -y dnf-plugins-core 2>/dev/null \
+            || log "warning: could not install dnf-plugins-core (may already be present)"
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo \
-            || die "could not add docker-ce repo"
+            || die "could not add docker-ce repo (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
         dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-            || die "docker-ce install failed via dnf fallback repo"
+            || die "docker-ce install failed via dnf fallback repo (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
         systemctl enable --now docker
         return 0
     fi

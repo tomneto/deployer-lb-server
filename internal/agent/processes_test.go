@@ -60,6 +60,44 @@ func TestSelectProcs_UnionOfPinnedAndTops(t *testing.T) {
 	}
 }
 
+func TestSelectProcs_TopIOAndConnsEvenWhenNotTopCPUOrRSS(t *testing.T) {
+	// 20 candidates with no CPU/RSS at all; pid 7 does heavy disk I/O and pid
+	// 13 holds many connections, neither of which shows up in CPU/RSS ranking.
+	cands := make([]procCandidate, 0, 20)
+	for i := 1; i <= 20; i++ {
+		cands = append(cands, procCandidate{pid: int32(i)})
+	}
+	cands[6].ioRate = 5_000_000 // pid 7
+	cands[12].conns = 42        // pid 13
+
+	selected, truncated := selectProcs(cands, nil, 15, 60)
+	if truncated {
+		t.Fatal("well under cap, must not be truncated")
+	}
+	sel := pidSet(selected)
+	if !sel[7] {
+		t.Fatalf("top-IO pid 7 missing from selection %v", selected)
+	}
+	if !sel[13] {
+		t.Fatalf("top-connections pid 13 missing from selection %v", selected)
+	}
+}
+
+func TestSelectProcs_ZeroIOAndConnsTiesAreNotSelected(t *testing.T) {
+	// All candidates sit at zero IO/connections — unlike CPU/RSS, a zero-value
+	// tie must not be treated as "top" just because of pid ordering.
+	cands := makeCands(100) // varying cpu/rss, ioRate=conns=0 for all
+	pinned := pidSet([]int32{1, 2, 3})
+
+	selected, truncated := selectProcs(cands, pinned, 15, 60)
+	if truncated {
+		t.Fatal("3 pinned + top-15 cpu/rss must not hit the cap")
+	}
+	if len(selected) != 18 {
+		t.Fatalf("expected 3 pinned + 15 top(cpu==rss) = 18, got %d: %v", len(selected), selected)
+	}
+}
+
 func TestSelectProcs_DisjointTops(t *testing.T) {
 	// 40 candidates: pids 1..20 are CPU-heavy with no RSS, 21..40 RSS-heavy
 	// with no CPU — top-15 of each dimension are disjoint sets.
