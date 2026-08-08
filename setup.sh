@@ -290,7 +290,8 @@ install_docker() {
     fi
     if have dnf; then
         log "get.docker.com failed — falling back to docker-ce repo (centos/EL9-compatible)"
-        dnf install -y dnf-plugins-core 2>/dev/null \
+        dnf config-manager --help >/dev/null 2>&1 \
+            || dnf install -y dnf-plugins-core 2>/dev/null \
             || log "warning: could not install dnf-plugins-core (may already be present)"
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo \
             || die "could not add docker-ce repo (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
