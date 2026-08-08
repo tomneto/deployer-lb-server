@@ -103,6 +103,15 @@ log()  { printf '[setup.sh][%s] %s\n' "$MODE" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# One-line RAM/swap snapshot, appended to every log/die around the docker-ce
+# install so a failure report always shows the memory state at the time of
+# the failure — whether or not memory turns out to be the actual cause.
+mem_snapshot() {
+    awk '/^MemTotal:/{t=$2} /^SwapTotal:/{s=$2} /^MemAvailable:/{a=$2}
+         END{printf "RAM=%dMB swap=%dMB avail=%dMB", t/1024, s/1024, a/1024}' \
+        /proc/meminfo
+}
+
 # ---------------------------------------------------------------------------
 # Distro detection (D-OS1) — informational + drives the RHEL-family-only
 # steps below (EPEL, firewalld, SELinux). The package-manager probes
@@ -289,28 +298,47 @@ step1_deps_lb() {
 # install/update on this host, not just this one run.
 ensure_swap() {
     have swapon || return 0  # no swap support on this system, nothing to do
-    local total_kb avail_kb swap_kb
+    local total_kb swap_kb floor_kb=$((2 * 1024 * 1024))
     total_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
     swap_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
-    # Only step in below ~2GB RAM with no existing swap — anything above
-    # that comfortably fits the docker-ce transaction without help.
-    if (( total_kb >= 2 * 1024 * 1024 )) || (( swap_kb > 0 )); then
+    # Decide on RAM+swap *combined* against the 2GB floor — a host that
+    # already ships a small factory swapfile (common on Oracle Linux images)
+    # used to skip this function entirely via `swap_kb > 0`, even when that
+    # swap plus RAM still didn't fit the docker-ce transaction. Top up instead
+    # of bailing out just because *some* swap already exists.
+    if (( total_kb + swap_kb >= floor_kb )); then
+        log "RAM+swap already sufficient ($(mem_snapshot)) — no swapfile action needed"
         return 0
     fi
-    avail_kb="$(df -Pk / | awk 'NR==2{print $4}')"
-    if (( avail_kb < 2 * 1024 * 1024 )); then
-        log "warning: low RAM (${total_kb}kB) and <2GB free disk — skipping swapfile creation"
+    local shortfall_kb=$(( floor_kb - total_kb - swap_kb ))
+    local shortfall_mb=$(( (shortfall_kb + 1023) / 1024 ))
+    local avail_kb; avail_kb="$(df -Pk / | awk 'NR==2{print $4}')"
+    if (( avail_kb < shortfall_kb + 512 * 1024 )); then
+        log "warning: RAM+swap below 2GB floor ($(mem_snapshot)) and disk too tight for a ${shortfall_mb}MB swapfile — skipping; docker-ce install below may be OOM-killed"
         return 0
     fi
-    log "low RAM (${total_kb}kB) and no swap — creating 2G swapfile at /swapfile"
-    if fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null; then
+    # This function only ever owns /swapfile. If it already created one on a
+    # previous run and RAM+swap is still short, swap it off and recreate it
+    # bigger by exactly the shortfall — everything else (other swap devices,
+    # if any) is already counted in swap_kb above.
+    local own_old_kb=0
+    if [[ -f /swapfile ]]; then
+        own_old_kb=$(( $(stat -c%s /swapfile 2>/dev/null || echo 0) / 1024 ))
+        log "topping up existing /swapfile (RAM+swap was $(mem_snapshot), below the 2GB floor) by ${shortfall_mb}MB"
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    else
+        log "RAM+swap below 2GB floor ($(mem_snapshot)) — creating ${shortfall_mb}MB swapfile at /swapfile"
+    fi
+    local new_size_mb=$(( (own_old_kb + shortfall_kb + 1023) / 1024 ))
+    if fallocate -l "${new_size_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$new_size_mb" 2>/dev/null; then
         chmod 600 /swapfile
         mkswap /swapfile >/dev/null \
             && swapon /swapfile \
             && grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >>/etc/fstab
-        log "swapfile active: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"
+        log "swapfile active: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ') — $(mem_snapshot)"
     else
-        log "warning: could not create /swapfile — proceeding without extra swap"
+        log "warning: could not create /swapfile — proceeding without extra swap ($(mem_snapshot))"
     fi
 }
 
@@ -333,8 +361,18 @@ install_docker() {
             || log "warning: could not install dnf-plugins-core (may already be present)"
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo \
             || die "could not add docker-ce repo (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
+        local dnf_rc=0
         dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-            || die "docker-ce install failed via dnf fallback repo (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
+            || dnf_rc=$?
+        if (( dnf_rc != 0 )); then
+            if (( dnf_rc >= 128 )); then
+                # 128+signal — 137 (SIGKILL) is the classic OOM-killer
+                # signature on a `dnf install` transaction this heavy; any
+                # signal-kill here is a memory problem, not a package/repo one.
+                die "docker-ce install was killed (dnf exit ${dnf_rc}, signal $((dnf_rc - 128))) — most likely the OOM killer. $(mem_snapshot). This is a MEMORY problem, not a repo/package problem: increase the host's RAM or attached disk (so ensure_swap can create a bigger swapfile) and re-run setup.sh. (OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID})"
+            fi
+            die "docker-ce install failed via dnf fallback repo (exit ${dnf_rc}, OS_ID=${OS_ID} OS_VERSION_ID=${OS_VERSION_ID}). $(mem_snapshot)"
+        fi
         systemctl enable --now docker
         return 0
     fi
