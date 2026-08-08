@@ -160,10 +160,13 @@ type CPUInfo struct {
 }
 
 type MemoryInfo struct {
-	TotalBytes     uint64  `json:"total_bytes"`
-	UsedBytes      uint64  `json:"used_bytes"`
-	AvailableBytes uint64  `json:"available_bytes"`
-	UsedPercent    float64 `json:"used_percent"`
+	TotalBytes      uint64  `json:"total_bytes"`
+	UsedBytes       uint64  `json:"used_bytes"`
+	AvailableBytes  uint64  `json:"available_bytes"`
+	UsedPercent     float64 `json:"used_percent"`
+	SwapTotalBytes  uint64  `json:"swap_total_bytes"`
+	SwapUsedBytes   uint64  `json:"swap_used_bytes"`
+	SwapUsedPercent float64 `json:"swap_used_percent"`
 }
 
 type DiskInfo struct {

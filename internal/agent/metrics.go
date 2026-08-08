@@ -48,6 +48,15 @@ func CollectServer(mountPoints []string) ServerInfo {
 			AvailableBytes: vm.Available,
 			UsedPercent:    vm.UsedPercent,
 		}
+		// Swap read failure is not fatal to the report — memory (RAM) is the
+		// primary signal and already collected above; swap is best-effort.
+		if sm, swapErr := mem.SwapMemory(); swapErr == nil {
+			info.Memory.SwapTotalBytes = sm.Total
+			info.Memory.SwapUsedBytes = sm.Used
+			info.Memory.SwapUsedPercent = sm.UsedPercent
+		} else {
+			info.Error = appendErr(info.Error, "swap: "+swapErr.Error())
+		}
 	}
 
 	if len(mountPoints) == 0 {

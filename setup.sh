@@ -85,6 +85,10 @@ AGENT_INTERVAL="8"
 # new flag.
 AGENT_DOCKER_STATS="${AGENT_DOCKER_STATS:-1}"
 IPTABLES_BOOTSTRAP_SCRIPT="${IPTABLES_BOOTSTRAP_SCRIPT:-}"
+# 1 = skip install_docker in step1_deps_agent — docker becomes an independent,
+# separately-triggered step (selfApi's docker_setup.ensure_docker via SSH)
+# instead of bundled into the monolithic agent provisioning run.
+SKIP_DOCKER=0
 
 # shared wireguard options
 WG_IFACE="wg0"
@@ -160,6 +164,7 @@ while [[ $# -gt 0 ]]; do
         --wg-peers) WG_PEERS="$2"; shift 2 ;;
         --wg-hub) WG_HUB="$2"; shift 2 ;;
         --iptables-bootstrap) IPTABLES_BOOTSTRAP_SCRIPT="$2"; shift 2 ;;
+        --skip-docker) SKIP_DOCKER=1; shift ;;
         *) die "unknown flag: $1" ;;
     esac
 done
@@ -298,10 +303,10 @@ step1_deps_lb() {
 # install/update on this host, not just this one run.
 ensure_swap() {
     have swapon || return 0  # no swap support on this system, nothing to do
-    local total_kb swap_kb floor_kb=$((2 * 1024 * 1024))
+    local total_kb swap_kb floor_kb=$((8 * 1024 * 1024))
     total_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
     swap_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
-    # Decide on RAM+swap *combined* against the 2GB floor — a host that
+    # Decide on RAM+swap *combined* against the 8GB floor — a host that
     # already ships a small factory swapfile (common on Oracle Linux images)
     # used to skip this function entirely via `swap_kb > 0`, even when that
     # swap plus RAM still didn't fit the docker-ce transaction. Top up instead
@@ -314,7 +319,7 @@ ensure_swap() {
     local shortfall_mb=$(( (shortfall_kb + 1023) / 1024 ))
     local avail_kb; avail_kb="$(df -Pk / | awk 'NR==2{print $4}')"
     if (( avail_kb < shortfall_kb + 512 * 1024 )); then
-        log "warning: RAM+swap below 2GB floor ($(mem_snapshot)) and disk too tight for a ${shortfall_mb}MB swapfile — skipping; docker-ce install below may be OOM-killed"
+        log "warning: RAM+swap below 8GB floor ($(mem_snapshot)) and disk too tight for a ${shortfall_mb}MB swapfile — skipping; docker-ce install below may be OOM-killed"
         return 0
     fi
     # This function only ever owns /swapfile. If it already created one on a
@@ -324,11 +329,11 @@ ensure_swap() {
     local own_old_kb=0
     if [[ -f /swapfile ]]; then
         own_old_kb=$(( $(stat -c%s /swapfile 2>/dev/null || echo 0) / 1024 ))
-        log "topping up existing /swapfile (RAM+swap was $(mem_snapshot), below the 2GB floor) by ${shortfall_mb}MB"
+        log "topping up existing /swapfile (RAM+swap was $(mem_snapshot), below the 8GB floor) by ${shortfall_mb}MB"
         swapoff /swapfile 2>/dev/null || true
         rm -f /swapfile
     else
-        log "RAM+swap below 2GB floor ($(mem_snapshot)) — creating ${shortfall_mb}MB swapfile at /swapfile"
+        log "RAM+swap below 8GB floor ($(mem_snapshot)) — creating ${shortfall_mb}MB swapfile at /swapfile"
     fi
     local new_size_mb=$(( (own_old_kb + shortfall_kb + 1023) / 1024 ))
     if fallocate -l "${new_size_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$new_size_mb" 2>/dev/null; then
@@ -340,6 +345,23 @@ ensure_swap() {
     else
         log "warning: could not create /swapfile — proceeding without extra swap ($(mem_snapshot))"
     fi
+}
+
+SWAPCTL_LIB_DIR="/usr/local/lib/deployer-lb-server"
+
+# Installs scripts/swapctl.sh + scripts/lib/swap-lib.sh onto the host so
+# selfApi can SSH-exec `swapctl status|resize|remove|drop-caches` later,
+# independent of provisioning. Called from both step4_config_lb and
+# step4_config_agent (every managed host gets it, lb or app server alike).
+install_swapctl() {
+    if [[ ! -f "$REPO_ROOT/scripts/swapctl.sh" || ! -f "$REPO_ROOT/scripts/lib/swap-lib.sh" ]]; then
+        log "warning: scripts/swapctl.sh or scripts/lib/swap-lib.sh not found under $REPO_ROOT — skipping swapctl install"
+        return 0
+    fi
+    mkdir -p "$SWAPCTL_LIB_DIR"
+    install -m 0755 "$REPO_ROOT/scripts/lib/swap-lib.sh" "$SWAPCTL_LIB_DIR/swap-lib.sh"
+    install -m 0755 "$REPO_ROOT/scripts/swapctl.sh" "$BIN_DIR/swapctl"
+    log "installed swapctl at $BIN_DIR/swapctl (lib: $SWAPCTL_LIB_DIR/swap-lib.sh)"
 }
 
 install_docker() {
@@ -381,7 +403,9 @@ install_docker() {
 
 step1_deps_agent() {
     log "step 1/6: dependencies (docker, wireguard-tools)"
-    if have docker; then
+    if (( SKIP_DOCKER )); then
+        log "--skip-docker set — leaving docker install to a separate step (or skipping if this target won't run docker-runtime pipelines)"
+    elif have docker; then
         log "docker already installed, OK"
     else
         install_docker
@@ -725,6 +749,7 @@ EOF
     open_firewalld_port 80 tcp
     open_firewalld_port 443 tcp
     ensure_selinux_compat /etc/nginx "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR"
+    install_swapctl
 
     nginx -t || die "nginx -t failed after installing template/snippets/catch-all"
 }
@@ -753,6 +778,7 @@ step4_config_agent() {
     fi
 
     write_agent_env
+    install_swapctl
 }
 
 # Shared by agent mode's step 4 and lb mode's extra agent install: writes the
