@@ -202,3 +202,92 @@ func TestContainerPIDs_Dedup(t *testing.T) {
 		t.Fatalf("ContainerPIDs() = %v, want %v", got, want)
 	}
 }
+
+// ── network membership (network_mode / networks / ip_address) ────────
+
+// The case the fields exist for: a bridge container and a host-network
+// container on the same box cannot reach each other by name, and nothing else
+// in the report says so.
+const fixtureNetworkInspectJSON = `[
+  {
+    "Id": "aaa",
+    "Name": "/api",
+    "Config": {"Image": "org/api:latest"},
+    "State": {"Status": "running"},
+    "HostConfig": {"NetworkMode": "bo-net"},
+    "NetworkSettings": {"Ports": {}, "Networks": {"bo-net": {"IPAddress": "172.20.0.5"}}}
+  },
+  {
+    "Id": "bbb",
+    "Name": "/seaweed",
+    "Config": {"Image": "chrislusf/seaweedfs:latest"},
+    "State": {"Status": "running"},
+    "HostConfig": {"NetworkMode": "host"},
+    "NetworkSettings": {"Ports": {}, "Networks": {"host": {"IPAddress": ""}}}
+  }
+]`
+
+func TestParseDockerInspect_ReadsNetworkMembership(t *testing.T) {
+	got, err := ParseDockerInspect([]byte(fixtureNetworkInspectJSON))
+	if err != nil {
+		t.Fatalf("ParseDockerInspect() error = %v", err)
+	}
+	if got[0].NetworkMode != "bo-net" {
+		t.Errorf("bridge NetworkMode = %q, want %q", got[0].NetworkMode, "bo-net")
+	}
+	if !reflect.DeepEqual(got[0].Networks, []string{"bo-net"}) {
+		t.Errorf("bridge Networks = %#v, want [bo-net]", got[0].Networks)
+	}
+	if got[0].IPAddress != "172.20.0.5" {
+		t.Errorf("bridge IPAddress = %q, want 172.20.0.5", got[0].IPAddress)
+	}
+	if got[1].NetworkMode != "host" {
+		t.Errorf("host NetworkMode = %q, want %q", got[1].NetworkMode, "host")
+	}
+	// An empty IP on a host-network container is information, not a gap: it has
+	// no interface of its own, which is why nothing on a bridge can address it.
+	if got[1].IPAddress != "" {
+		t.Errorf("host IPAddress = %q, want empty", got[1].IPAddress)
+	}
+}
+
+func TestParseNetworks_SortsNamesAndTakesTheFirstIP(t *testing.T) {
+	raw := map[string]struct {
+		IPAddress string `json:"IPAddress"`
+	}{
+		"zeta":   {IPAddress: "10.0.0.9"},
+		"bo-net": {IPAddress: "172.20.0.5"},
+	}
+	names, ip := parseNetworks(raw)
+	if !reflect.DeepEqual(names, []string{"bo-net", "zeta"}) {
+		t.Errorf("names = %#v, want [bo-net zeta]", names)
+	}
+	// Sorted first, so the report is stable across ticks.
+	if ip != "172.20.0.5" {
+		t.Errorf("ip = %q, want 172.20.0.5", ip)
+	}
+}
+
+func TestParseNetworks_EmptyStaysNil(t *testing.T) {
+	// nil (not an empty slice) keeps the key out of the JSON entirely, so an
+	// agent reporting nothing here is byte-identical to one that predates it.
+	names, ip := parseNetworks(nil)
+	if names != nil {
+		t.Errorf("names = %#v, want nil", names)
+	}
+	if ip != "" {
+		t.Errorf("ip = %q, want empty", ip)
+	}
+}
+
+func TestParseDockerInspect_MissingNetworkFieldsStayZero(t *testing.T) {
+	// The pre-existing fixture carries no HostConfig and no Networks: an older
+	// docker, or a trimmed inspect, must not become a parse error.
+	got, err := ParseDockerInspect([]byte(fixtureInspectJSON))
+	if err != nil {
+		t.Fatalf("ParseDockerInspect() error = %v", err)
+	}
+	if got[0].NetworkMode != "" || got[0].Networks != nil || got[0].IPAddress != "" {
+		t.Errorf("expected zero network fields, got %#v", got[0])
+	}
+}

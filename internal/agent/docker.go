@@ -71,7 +71,15 @@ type dockerInspectEntry struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
+		// Networks is keyed by network name; a host-network container has a
+		// single "host" entry whose IPAddress is empty (it owns no interface).
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
 	} `json:"NetworkSettings"`
+	HostConfig struct {
+		NetworkMode string `json:"NetworkMode"`
+	} `json:"HostConfig"`
 }
 
 // CollectContainers lists containers via `docker ps -q` then resolves detail
@@ -143,6 +151,8 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 			c.Health = e.State.Health.Status
 		}
 		c.ExposedPorts = parseExposedPorts(e.Config.ExposedPorts)
+		c.NetworkMode = e.HostConfig.NetworkMode
+		c.Networks, c.IPAddress = parseNetworks(e.NetworkSettings.Networks)
 
 		containerPorts := make([]string, 0, len(e.NetworkSettings.Ports))
 		for containerPort := range e.NetworkSettings.Ports {
@@ -163,6 +173,31 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// parseNetworks turns docker's `NetworkSettings.Networks` map into the sorted
+// network names plus the IP on the first of them.
+//
+// The IP is deliberately "the first network's" rather than a map: it exists to
+// answer "can something else address this container directly", and a container
+// on several networks is answered by joining on the NAMES instead. A
+// host-network container yields the name "host" and an empty IP — the empty IP
+// is information, not a gap.
+//
+// Returns nil (not an empty slice) when there is nothing, so the field stays
+// out of the JSON entirely.
+func parseNetworks(raw map[string]struct {
+	IPAddress string `json:"IPAddress"`
+}) ([]string, string) {
+	if len(raw) == 0 {
+		return nil, ""
+	}
+	names := make([]string, 0, len(raw))
+	for name := range raw {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, raw[names[0]].IPAddress
 }
 
 // parseExposedPorts turns docker's `Config.ExposedPorts` keys ("8080/tcp",

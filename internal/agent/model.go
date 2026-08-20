@@ -258,6 +258,25 @@ type Container struct {
 	// (`Config.ExposedPorts`), regardless of whether they were published to the
 	// host — Ports above only describes the published bindings.
 	ExposedPorts []int `json:"exposed_ports,omitempty"`
+	// Where this container sits on the network. Without these three the
+	// backend can see a container and still not know whether anything else can
+	// reach it: a container on a bridge network and one sharing the host
+	// namespace are unreachable from each other by name, and that mismatch is
+	// invisible in every other field here.
+	//
+	// NetworkMode is `HostConfig.NetworkMode` verbatim — "host", "bridge",
+	// "default", a network name, or "container:<id>" when it joined another
+	// container's namespace. Networks are the keys of
+	// `NetworkSettings.Networks`, sorted for a stable report. IPAddress is the
+	// address on the first of those networks, and is EMPTY for a host-network
+	// container — it has no interface of its own, which is precisely the case
+	// the backend has to detect.
+	//
+	// All three are `omitempty`: an agent older than this field simply omits
+	// them, and the intake accepts the payload unchanged.
+	NetworkMode string   `json:"network_mode,omitempty"`
+	Networks    []string `json:"networks,omitempty"`
+	IPAddress   string   `json:"ip_address,omitempty"`
 }
 
 // ContainerStats is one `docker stats` row, keyed by container ID in the map
