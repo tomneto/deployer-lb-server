@@ -64,7 +64,24 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Release notes are WRITTEN, in the tag's annotation — `git tag -a vX.Y.Z`
+      # with the summary of what changed. The auto-generated commit list still
+      # rides along (generate_release_notes below), but it is the appendix, not
+      # the notes: a commit subject list doesn't tell an operator whether a new
+      # agent is safe to roll out. A lightweight tag has no annotation, so the
+      # body is left empty and only the generated list shows.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release notes from the tag annotation
+        run: |
+          set -euo pipefail
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
+          cat notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: notes.md
           generate_release_notes: true
