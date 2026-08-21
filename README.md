@@ -14,6 +14,11 @@ dependencies, WireGuard, the binary itself, config, and the systemd unit.
   that POSTs reports to the backoffice intake.
 - `internal/lbserver`, `internal/nginx`, `internal/render` — LB-mode config
   rendering/reload.
+- `conf/nginx-app.conf.tmpl` — the managed vhost template. It carries
+  `client_max_body_size 100m;` on purpose: nginx defaults to 1m, which is
+  below the 3MB slices the backend's chunked upload sends, so uploads got a
+  bare 413 from the proxy. 100m matches Cloudflare's Free/Pro cap and leaves
+  the real ceiling to the application. Do not drop it.
 - `internal/provision`, `internal/version`, `internal/auth` — shared
   provisioning/versioning/auth helpers.
 - `setup.sh` — the idempotent installer driven over SSH by selfApi's

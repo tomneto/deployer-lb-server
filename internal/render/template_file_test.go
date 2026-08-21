@@ -46,6 +46,9 @@ func TestNginxAppTemplate_MatchesPlanExampleBlock(t *testing.T) {
 		"listen 80;",
 		"server_name app-a.workspacefy.com;",
 		"underscores_in_headers on;",
+		// Sem isto o nginx aplica o default de 1m e responde 413 nos chunks
+		// de 3MB do upload chunked do backend.
+		"client_max_body_size 100m;",
 		"include snippets/error-pages.conf;",
 		"include snippets/cloudflare-real-ip.conf;",
 		"proxy_pass http://app_a_pool;",

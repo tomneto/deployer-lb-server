@@ -36,6 +36,12 @@ server {
     listen 80;                          # D11: HTTP puro na origem (cert é da CF, na borda)
     server_name {{ join .Domains " " }};
     underscores_in_headers on;
+    # O default do nginx (1m) fica abaixo dos chunks de 3MB que o upload
+    # chunked do backend envia (storage.py CHUNK_SIZE), então o proxy
+    # respondia 413 antes da request chegar no app. 100m acompanha o cap
+    # da Cloudflare (Free/Pro) e devolve a decisão para a aplicação, que
+    # responde um 413 estruturado que o frontend sabe tratar.
+    client_max_body_size 100m;
     include snippets/error-pages.conf;
     include snippets/cloudflare-real-ip.conf;   # set_real_ip_from <ranges CF> + real_ip_header CF-Connecting-IP
 
