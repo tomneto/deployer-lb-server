@@ -4,6 +4,7 @@ package agent
 
 import (
 	"reflect"
+	"strconv"
 	"syscall"
 	"testing"
 
@@ -103,3 +104,91 @@ func TestClassifyConnections_EmptyHostReportsOKWithoutTopPorts(t *testing.T) {
 		t.Errorf("got %+v, want all-zero counts", got)
 	}
 }
+
+func TestClassifyConnections_PeersAggregateByRemoteIP(t *testing.T) {
+	conns := []gonet.ConnectionStat{
+		{Type: syscall.SOCK_STREAM, Status: "LISTEN", Laddr: gonet.Addr{IP: "0.0.0.0", Port: 443}},
+		{Type: syscall.SOCK_STREAM, Status: "LISTEN", Laddr: gonet.Addr{IP: "0.0.0.0", Port: 80}},
+		// One busy client across both listening ports…
+		{Type: syscall.SOCK_STREAM, Status: "ESTABLISHED", Laddr: gonet.Addr{Port: 443}, Raddr: gonet.Addr{IP: "1.2.3.4", Port: 51000}},
+		{Type: syscall.SOCK_STREAM, Status: "ESTABLISHED", Laddr: gonet.Addr{Port: 443}, Raddr: gonet.Addr{IP: "1.2.3.4", Port: 51001}},
+		{Type: syscall.SOCK_STREAM, Status: "ESTABLISHED", Laddr: gonet.Addr{Port: 80}, Raddr: gonet.Addr{IP: "1.2.3.4", Port: 51002}},
+		// …a quieter one…
+		{Type: syscall.SOCK_STREAM, Status: "ESTABLISHED", Laddr: gonet.Addr{Port: 443}, Raddr: gonet.Addr{IP: "5.6.7.8", Port: 40000}},
+		// …and an outbound peer, which carries no local ports.
+		{Type: syscall.SOCK_STREAM, Status: "ESTABLISHED", Laddr: gonet.Addr{Port: 51234}, Raddr: gonet.Addr{IP: "8.8.8.8", Port: 443}},
+		// Non-established states never reach the peer list.
+		{Type: syscall.SOCK_STREAM, Status: "TIME_WAIT", Laddr: gonet.Addr{Port: 443}, Raddr: gonet.Addr{IP: "9.9.9.9", Port: 41000}},
+	}
+
+	got := classifyConnections(conns).Peers
+
+	want := []PeerCount{
+		{IP: "1.2.3.4", Inbound: 3, Total: 3, Ports: []uint32{80, 443}},
+		{IP: "5.6.7.8", Inbound: 1, Total: 1, Ports: []uint32{443}},
+		{IP: "8.8.8.8", Outbound: 1, Total: 1},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Peers = %+v, want %+v", got, want)
+	}
+}
+
+func TestClassifyConnections_PeersCappedButCountedInFull(t *testing.T) {
+	conns := []gonet.ConnectionStat{
+		{Type: syscall.SOCK_STREAM, Status: "LISTEN", Laddr: gonet.Addr{Port: 443}},
+	}
+	// More distinct peers than the cap, the busiest one last so ordering (not
+	// insertion) is what decides who survives the cut.
+	for i := 0; i < maxPeerEntries+30; i++ {
+		count := 1
+		if i == maxPeerEntries+29 {
+			count = 500 // the peer hammering us
+		}
+		for j := 0; j < count; j++ {
+			conns = append(conns, gonet.ConnectionStat{
+				Type: syscall.SOCK_STREAM, Status: "ESTABLISHED",
+				Laddr: gonet.Addr{Port: 443},
+				Raddr: gonet.Addr{IP: "10.9." + itoa(i/256) + "." + itoa(i%256), Port: uint32(40000 + j)},
+			})
+		}
+	}
+
+	got := classifyConnections(conns)
+
+	if len(got.Peers) != maxPeerEntries {
+		t.Fatalf("len(Peers) = %d, want %d", len(got.Peers), maxPeerEntries)
+	}
+	// The count is taken before the cut: truncating first would have shown 50.
+	if got.Peers[0].Total != 500 {
+		t.Errorf("Peers[0] = %+v, want Total 500", got.Peers[0])
+	}
+}
+
+func TestClassifyConnections_PeerPortsAreCapped(t *testing.T) {
+	var conns []gonet.ConnectionStat
+	// One IP landing on more listening ports than a row is allowed to show.
+	for i := 0; i < maxPeerPorts+5; i++ {
+		port := uint32(8000 + i)
+		conns = append(conns,
+			gonet.ConnectionStat{Type: syscall.SOCK_STREAM, Status: "LISTEN", Laddr: gonet.Addr{Port: port}},
+			gonet.ConnectionStat{
+				Type: syscall.SOCK_STREAM, Status: "ESTABLISHED",
+				Laddr: gonet.Addr{Port: port}, Raddr: gonet.Addr{IP: "1.2.3.4", Port: 50000 + port},
+			})
+	}
+
+	got := classifyConnections(conns).Peers
+
+	if len(got) != 1 {
+		t.Fatalf("len(Peers) = %d, want 1", len(got))
+	}
+	if len(got[0].Ports) != maxPeerPorts {
+		t.Errorf("len(Ports) = %d, want %d", len(got[0].Ports), maxPeerPorts)
+	}
+	// Every socket still counts, even the ones whose port didn't make the list.
+	if got[0].Total != uint32(maxPeerPorts+5) {
+		t.Errorf("Total = %d, want %d", got[0].Total, maxPeerPorts+5)
+	}
+}
+
+func itoa(v int) string { return strconv.Itoa(v) }

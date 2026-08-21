@@ -66,10 +66,12 @@ type DiskDevice struct {
 	IoTimeMs   uint64 `json:"io_time_ms"`
 }
 
-// ConnectionsInfo is the socket census: AGGREGATE COUNTS ONLY. A busy host has
-// tens of thousands of sockets and the full listing would dwarf the rest of
-// the report — TopPorts is the bounded drill-down that answers "who is being
-// hit" without shipping every tuple.
+// ConnectionsInfo is the socket census: AGGREGATE COUNTS plus two bounded
+// drill-downs. A busy host has tens of thousands of sockets and the full
+// listing would dwarf the rest of the report, so the tuples never ship whole —
+// TopPorts answers "which service is being hit" and Peers answers "which
+// remote addresses are hitting it", both computed over every socket and only
+// then truncated.
 //
 // Inbound/outbound follow the central's own classification
 // (infra._classify_connections): an ESTABLISHED socket whose LOCAL port is one
@@ -89,6 +91,27 @@ type ConnectionsInfo struct {
 	// forwards it verbatim as `snapshot.connections` for the frontend's
 	// "Conexões (entrada/saída)" list.
 	Conns []ConnEntry `json:"connections,omitempty"`
+	// Peers is the same census aggregated BY REMOTE IP (bounded by
+	// maxPeerEntries), which is the question a network dashboard actually
+	// asks — "who is talking to this box, and how much" — and the one Conns
+	// cannot answer: Conns is a truncated sample of individual sockets, so a
+	// client holding 300 connections looks the same there as one holding 2.
+	// Aggregation happens here, on the host, over the FULL socket list;
+	// truncating first and aggregating in the backend would undercount.
+	Peers []PeerCount `json:"peers,omitempty"`
+}
+
+// PeerCount is one remote IP and how many established sockets it holds, split
+// by direction (same classification as ConnectionsInfo.Inbound/Outbound).
+// Ports are the LOCAL ports its inbound sockets landed on — "which service is
+// this IP using" — bounded by maxPeerPorts and empty for a purely outbound
+// peer.
+type PeerCount struct {
+	IP       string   `json:"ip"`
+	Inbound  uint32   `json:"inbound"`
+	Outbound uint32   `json:"outbound"`
+	Total    uint32   `json:"total"`
+	Ports    []uint32 `json:"ports,omitempty"`
 }
 
 // ConnEntry is one established socket: which side dialed (Direction, same

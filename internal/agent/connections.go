@@ -29,6 +29,18 @@ const maxTopPorts = 10
 // reasoning as maxTopPorts: the frontend only ever renders a handful of rows.
 const maxConnEntries = 50
 
+// How many remote IPs ride in ConnectionsInfo.Peers. Wider than maxConnEntries
+// because this list is the point of the network screen ("quais IPs estão
+// conectados") and one row per IP is far cheaper than one row per socket: a
+// host being scanned or fronted by a CDN has thousands of sockets across a few
+// dozen addresses. Counts are computed over EVERY socket before this cut, so
+// the rows that do ship carry true totals.
+const maxPeerEntries = 100
+
+// Local ports listed per peer. Enough to tell "this IP is on 443 and 80" from
+// "this IP is crawling every port", without turning one row into a port dump.
+const maxPeerPorts = 6
+
 // classifyConnections is the pure core of CollectConnections: it turns a socket
 // census into aggregate counts. Kept parameter-free of syscalls so the
 // classification — the part with actual semantics — is table-testable.
@@ -51,6 +63,8 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 
 	info := ConnectionsInfo{OK: true}
 	perPort := map[uint32]uint32{}
+	perPeer := map[string]*PeerCount{}
+	peerPorts := map[string]map[uint32]bool{}
 	var entries []ConnEntry
 	for _, c := range conns {
 		switch {
@@ -73,6 +87,22 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 				Remote:    fmt.Sprintf("%s:%d", c.Raddr.IP, c.Raddr.Port),
 				Local:     fmt.Sprintf("%s:%d", c.Laddr.IP, c.Laddr.Port),
 			})
+			// Aggregate by remote IP over every socket, before any cut.
+			if ip := c.Raddr.IP; ip != "" {
+				peer := perPeer[ip]
+				if peer == nil {
+					peer = &PeerCount{IP: ip}
+					perPeer[ip] = peer
+					peerPorts[ip] = map[uint32]bool{}
+				}
+				peer.Total++
+				if direction == "inbound" {
+					peer.Inbound++
+					peerPorts[ip][c.Laddr.Port] = true
+				} else {
+					peer.Outbound++
+				}
+			}
 		case c.Type == syscall.SOCK_DGRAM && c.Raddr.Port == 0:
 			info.Listening++
 		}
@@ -95,6 +125,36 @@ func classifyConnections(conns []gonet.ConnectionStat) ConnectionsInfo {
 	}
 	if len(top) > 0 {
 		info.TopPorts = top
+	}
+
+	peers := make([]PeerCount, 0, len(perPeer))
+	for ip, p := range perPeer {
+		ports := make([]uint32, 0, len(peerPorts[ip]))
+		for port := range peerPorts[ip] {
+			ports = append(ports, port)
+		}
+		sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+		if len(ports) > maxPeerPorts {
+			ports = ports[:maxPeerPorts]
+		}
+		entry := *p
+		if len(ports) > 0 {
+			entry.Ports = ports
+		}
+		peers = append(peers, entry)
+	}
+	// Busiest peer first; IP breaks ties so the report is deterministic.
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].Total != peers[j].Total {
+			return peers[i].Total > peers[j].Total
+		}
+		return peers[i].IP < peers[j].IP
+	})
+	if len(peers) > maxPeerEntries {
+		peers = peers[:maxPeerEntries]
+	}
+	if len(peers) > 0 {
+		info.Peers = peers
 	}
 
 	// Deterministic order (remote endpoint), same reasoning as TopPorts.
