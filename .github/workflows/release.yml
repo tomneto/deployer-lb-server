@@ -59,11 +59,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
+      # Checkout FIRST, download-artifact SECOND. actions/checkout defaults to
+      # clean:true, which runs `git clean -ffdx` over the workspace and deletes
+      # any untracked directory already sitting there — including `dist/`.
+      # With the order reversed, v0.3.0 published a release with ZERO assets
+      # and the workflow still reported success, because `files:` matching
+      # nothing is not an error for action-gh-release. Do not move this step
+      # back down.
+      #
       # Release notes are WRITTEN, in the tag's annotation — `git tag -a vX.Y.Z`
       # with the summary of what changed. The auto-generated commit list still
       # rides along (generate_release_notes below), but it is the appendix, not
@@ -74,11 +77,31 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Release notes from the tag annotation
         run: |
           set -euo pipefail
           git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
           cat notes.md
+
+      # Belt and braces for the failure above: assert the four assets are on
+      # disk before publishing, so a release can never again be cut empty and
+      # be reported as a success. setup.sh's download_or_build_binary() falls
+      # back to `go build` when an asset 404s, so an empty release degrades
+      # silently into "every target compiles Go at provisioning time" — the
+      # exact outcome this workflow exists to prevent.
+      - name: Verify assets before publishing
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          for f in deployer-lb-server-linux-amd64 deployer-lb-server-linux-arm64 \
+                   deployer-lb-agent-linux-amd64 deployer-lb-agent-linux-arm64; do
+            [[ -s "dist/$f" ]] || { echo "missing or empty asset: dist/$f" >&2; exit 1; }
+          done
 
       - uses: softprops/action-gh-release@v2
         with:
