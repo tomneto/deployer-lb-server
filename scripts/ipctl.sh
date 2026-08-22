@@ -29,6 +29,28 @@
 # stdout. Non-zero exit on any failure.
 set -euo pipefail
 
+# Snapshot argv before the parser consumes it — the self-elevation below
+# re-execs with the original invocation.
+IPCTL_ARGS=("$@")
+
+# Everything here needs root: `nft` refuses to read or write the ruleset
+# otherwise. selfApi reaches this over SSH through executor.run, which does NOT
+# prefix sudo, and provisioning explicitly accepts a NOPASSWD-sudo user as well
+# as root (setup.sh's ELEVATION_PROBE_CMD) — so on those hosts every ipctl call
+# would fail with a permission error that reads like "nft is broken". Same
+# guard, same wording, as setup.sh's elevate_to_root().
+#
+# stdin matters here: `apply` reads the desired policy from it, and re-execing
+# through sudo has to preserve it. `sudo` passes stdin through unchanged, so
+# the pipe survives the exec.
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        exec sudo -n bash "$0" ${IPCTL_ARGS[@]+"${IPCTL_ARGS[@]}"}
+    fi
+    echo "ipctl: needs root; the current user ($(id -un)) has no passwordless sudo (NOPASSWD)." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$SCRIPT_DIR/lib/ip-lib.sh"
 if [[ ! -f "$LIB" ]]; then
