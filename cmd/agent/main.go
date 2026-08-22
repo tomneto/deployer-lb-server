@@ -48,6 +48,7 @@ func main() {
 		// hosts where it competes with the report interval.
 		dockerStats      = flag.Bool("docker-stats", envBoolOr("AGENT_DOCKER_STATS", true), "collect per-container stats via `docker stats --no-stream` (expensive on hosts with many containers)")
 		dockerStatsLimit = flag.Duration("docker-stats-timeout", envDurationOr("AGENT_DOCKER_STATS_TIMEOUT", 5*time.Second), "hard deadline for the `docker stats` call; past it the report ships without per-container stats")
+		securityInterval = flag.Duration("security-interval", envDurationOr("AGENT_SECURITY_INTERVAL", 60*time.Second), "how often to re-read the nft ip guard and CrowdSec decisions; the cached value ships on every report in between")
 		showVerS         = flag.Bool("v", false, "print version and exit")
 		showVerL         = flag.Bool("version", false, "print version and exit")
 	)
@@ -103,6 +104,9 @@ func main() {
 		// needs two samples on the same handle for a real cpu_percent, so the
 		// cache must survive across ticks (improves.md WS-4).
 		procCache: agent.NewProcCache(),
+		// Like procCache, this must outlive a single tick — it is what makes
+		// the security section cheap enough to ship every 8 seconds.
+		secCache: newSecurityCache(*securityInterval),
 	})
 
 	log.Println("deployer-lb-agent stopped")
@@ -121,6 +125,49 @@ type loopConfig struct {
 	procCache     *agent.ProcCache
 	dockerStats   bool
 	statsTimeout  time.Duration
+	secCache      *securityCache
+}
+
+// securityCache throttles CollectSecurity to its own interval.
+//
+// The report goes out every 8s; the guard sets and CrowdSec decisions change
+// when an operator clicks a button or a scenario fires — minutes apart at
+// best. Shelling out to ipctl, cscli and systemctl on every tick would be
+// four extra processes per 8 seconds forever to re-read a value that did not
+// move.
+//
+// The cached value is re-sent on the intermediate ticks rather than the
+// section being omitted, so the payload shape never oscillates between
+// present and absent — a consumer diffing two consecutive reports must not
+// see a section disappear and read that as "the guard was torn down".
+// SecurityInfo.CollectedAt carries the real age.
+//
+// No mutex: runLoop is single-goroutine, and this is only ever touched from
+// tick().
+type securityCache struct {
+	interval time.Duration
+	last     time.Time
+	value    *agent.SecurityInfo
+}
+
+func newSecurityCache(interval time.Duration) *securityCache {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	return &securityCache{interval: interval}
+}
+
+func (c *securityCache) get(now time.Time) *agent.SecurityInfo {
+	if c == nil {
+		return nil
+	}
+	if c.value != nil && now.Sub(c.last) < c.interval {
+		return c.value
+	}
+	v := agent.CollectSecurity(agent.ExecRunner, now)
+	c.value = &v
+	c.last = now
+	return c.value
 }
 
 // runLoop is the core periodic loop, deliberately free of package-level
@@ -216,6 +263,8 @@ func buildReport(cfg loopConfig) agent.Report {
 		// remote server view from rendering the same Overview/Rede cards.
 		DiskIO:      agent.CollectDiskIO(),
 		Connections: connections,
+		// Refreshed on its own slow cadence — see securityCache.
+		Security: cfg.secCache.get(now),
 	}
 }
 

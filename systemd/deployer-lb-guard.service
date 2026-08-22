@@ -1,0 +1,32 @@
+[Unit]
+Description=deployer-lb-server IP guard - restore the bo_guard nftables table at boot
+Documentation=https://github.com/tomneto/deployer-lb-server
+# nftables sets live in kernel memory and are gone after a reboot. Without
+# this unit every operator-declared block silently lapses on the next restart
+# — the backoffice would still show the rule as active while the host stopped
+# enforcing it, which is the worst of both worlds. ipctl rewrites
+# /etc/deployer-lb-server/nft/bo_guard.nft (rules AND set elements) on every
+# apply, and this replays it.
+#
+# Before the network comes up, so there is no window where the box is
+# reachable with an empty blocklist. Before docker for the same reason: the
+# guard chain runs at priority -10, ahead of docker's published ports.
+DefaultDependencies=no
+Before=network-pre.target docker.service
+Wants=network-pre.target
+ConditionPathExists=/etc/deployer-lb-server/nft/bo_guard.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The file starts with `table inet bo_guard` / `delete table inet bo_guard`,
+# so replaying it is idempotent whether or not the table already exists.
+ExecStart=/usr/local/bin/ipctl restore
+# A restore failure must not block boot. A host that comes up unguarded and
+# reachable is recoverable from the panel; a host that fails to boot is not.
+# The agent reports the empty table, selfApi sees the drift, and the sync
+# worker re-applies.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=sysinit.target

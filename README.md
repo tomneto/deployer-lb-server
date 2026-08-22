@@ -49,7 +49,7 @@ go test -tags agent ./internal/...
 ```
 
 Covers `internal/agent`'s collectors (connections, disk I/O, docker/images/
-stats, ports, processes, systemd, WireGuard) and the signed transport
+stats, ports, processes, security, systemd, WireGuard) and the signed transport
 (`transport_test.go`, HMAC scheme in `hmac_test.go`) via injectable seams
 (`Runner`, `PingFunc`, `httptest`) — no real host state, no network, no
 Docker. Also runs `internal/auth`, `internal/lbserver`, `internal/nginx`,
@@ -66,6 +66,17 @@ binary that doesn't match the current checkout's version):
 ```
 bash scripts/test-download-or-build-binary.sh
 ```
+
+And one for the nftables IP guard (`scripts/lib/ip-lib.sh`), which drives the
+reconcile diff, the `/32` normalization and the protected-range refusal
+against a mock `nft` that keeps set contents in files:
+
+```
+bash scripts/test-ipctl.sh
+```
+
+No root, no nftables, no container. What it deliberately does not cover is
+whether the kernel accepts the ruleset — that is tier 2.
 
 No Docker, no network — extracts the real function out of `setup.sh` and
 exercises it against a throwaway local git repo + fake binaries.

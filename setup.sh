@@ -15,6 +15,10 @@
 #                        --interval 8 --wg-ip <wireguard_ip> \
 #                        --wg-hub <pubkey:endpoint,...>
 #
+# Both modes also accept --with-crowdsec (install CrowdSec + the nftables
+# firewall bouncer, standalone LAPI on this host) and --security-interval
+# <dur> (how often the agent re-reads the nft guard and CrowdSec decisions).
+#
 # `lb` mode also installs the telemetry agent (same binary/unit/env vars as
 # agent mode) when --intake-url/--agent-token are provided, so LBs report
 # host/ports/procs/units like any other server (WS-6 "LB de corpo inteiro").
@@ -109,6 +113,24 @@ WG_HUB=""     # agent: comma-separated pubkey:endpoint (hub(s) to peer with)
 LB_TOKEN=""
 LB_SECRET=""
 
+# 1 = install CrowdSec + crowdsec-firewall-bouncer-nftables on this host, with
+# a LOCAL LAPI (standalone per server — no central LAPI to register against).
+# Default OFF: CrowdSec installs packages, opens a service and starts dropping
+# traffic on its own judgement, so it only ever happens when the operator
+# explicitly asked for it on this target. --skip-crowdsec is the explicit
+# no-op form, kept so selfApi can always pass one or the other rather than
+# relying on the default staying what it is today.
+WITH_CROWDSEC=0
+SKIP_CROWDSEC=0
+# Collections enabled on install. crowdsecurity/linux covers sshd and the
+# common syslog scenarios; nginx is added only on lb hosts (step_crowdsec),
+# since parsing an access log that does not exist just fills the logs with
+# warnings.
+CROWDSEC_COLLECTIONS="crowdsecurity/linux"
+# How often the agent re-reads `nft list` + `cscli decisions list`. Far slower
+# than AGENT_INTERVAL on purpose — see write_agent_env.
+AGENT_SECURITY_INTERVAL="${AGENT_SECURITY_INTERVAL:-60s}"
+
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 
@@ -193,11 +215,15 @@ while [[ $# -gt 0 ]]; do
         --iptables-bootstrap) IPTABLES_BOOTSTRAP_SCRIPT="$2"; shift 2 ;;
         --skip-docker) SKIP_DOCKER=1; shift ;;
         --with-docker) WITH_DOCKER=1; shift ;;
+        --with-crowdsec) WITH_CROWDSEC=1; shift ;;
+        --skip-crowdsec) SKIP_CROWDSEC=1; shift ;;
+        --security-interval) AGENT_SECURITY_INTERVAL="$2"; shift 2 ;;
         *) die "unknown flag: $1" ;;
     esac
 done
 
 (( SKIP_DOCKER && WITH_DOCKER )) && die "--skip-docker and --with-docker are mutually exclusive"
+(( SKIP_CROWDSEC && WITH_CROWDSEC )) && die "--skip-crowdsec and --with-crowdsec are mutually exclusive"
 
 if [[ "$MODE" == "lb" ]]; then
     [[ -n "$WG_IP" ]] || die "--wg-ip is required for mode lb"
@@ -392,6 +418,160 @@ install_swapctl() {
     install -m 0755 "$REPO_ROOT/scripts/lib/swap-lib.sh" "$SWAPCTL_LIB_DIR/swap-lib.sh"
     install -m 0755 "$REPO_ROOT/scripts/swapctl.sh" "$BIN_DIR/swapctl"
     log "installed swapctl at $BIN_DIR/swapctl (lib: $SWAPCTL_LIB_DIR/swap-lib.sh)"
+}
+
+# ---------------------------------------------------------------------------
+# IP guard (nftables) + CrowdSec
+# ---------------------------------------------------------------------------
+
+# nftables is the userspace tool for the `inet bo_guard` table that ipctl
+# manages. Present by default on most modern distros, but not all minimal
+# images ship it, and OCI's Oracle Linux images in particular boot with
+# iptables-nft and no `nft` binary.
+ensure_nft_installed() {
+    if have nft || [[ -x /usr/sbin/nft || -x /sbin/nft ]]; then
+        log "nftables already present, OK"
+        return 0
+    fi
+    log "nftables not found, installing"
+    # Never fatal, unlike ensure_wireguard_tools_version above. WireGuard is
+    # load-bearing — no overlay, no deploys. The IP guard is an addition to a
+    # host that already works, so failing the whole provisioning run over it
+    # would trade a working target for an optional feature. The agent reports
+    # nft_present:false and the panel says why.
+    local rc=0
+    if have apt-get; then
+        { apt-get update -y && apt-get install -y nftables; } || rc=$?
+    elif have dnf; then
+        ensure_rhel_epel
+        dnf install -y nftables || rc=$?
+    elif have yum; then
+        yum install -y nftables || rc=$?
+    else
+        log "warning: no supported package manager to install nftables — ipctl will report nft_present:false and per-IP blocking stays unavailable on this host"
+        return 0
+    fi
+    if (( rc != 0 )); then
+        log "warning: nftables install failed (rc=$rc) — per-IP blocking stays unavailable on this host"
+    fi
+    return 0
+}
+
+# Installs scripts/ipctl.sh + scripts/lib/ip-lib.sh and the boot-restore unit,
+# so selfApi can SSH-exec `ipctl apply|list|status` later. Same shape and same
+# call sites as install_swapctl — every managed host gets it, lb or app server
+# alike, because an IP can be attacking either.
+#
+# Note the unit is enabled but NOT started here: its whole job is to replay
+# the persisted ruleset at boot, and running it now would only re-apply what
+# is already live.
+install_ipctl() {
+    if [[ ! -f "$REPO_ROOT/scripts/ipctl.sh" || ! -f "$REPO_ROOT/scripts/lib/ip-lib.sh" ]]; then
+        log "warning: scripts/ipctl.sh or scripts/lib/ip-lib.sh not found under $REPO_ROOT — skipping ipctl install"
+        return 0
+    fi
+    ensure_nft_installed
+    mkdir -p "$SWAPCTL_LIB_DIR"
+    install -m 0755 "$REPO_ROOT/scripts/lib/ip-lib.sh" "$SWAPCTL_LIB_DIR/ip-lib.sh"
+    install -m 0755 "$REPO_ROOT/scripts/ipctl.sh" "$BIN_DIR/ipctl"
+    log "installed ipctl at $BIN_DIR/ipctl (lib: $SWAPCTL_LIB_DIR/ip-lib.sh)"
+
+    if [[ -f "$REPO_ROOT/systemd/deployer-lb-guard.service" ]]; then
+        install -m 0644 "$REPO_ROOT/systemd/deployer-lb-guard.service" "$SYSTEMD_DIR/deployer-lb-guard.service"
+        systemctl daemon-reload
+        systemctl enable deployer-lb-guard.service >/dev/null 2>&1 \
+            || log "warning: could not enable deployer-lb-guard.service — blocks will not survive a reboot"
+    fi
+
+    # Create the table now so the agent's first report already carries a
+    # `security.guard` section instead of "table missing", and so the operator
+    # can see the guard exists before ever writing a rule into it.
+    if have nft || [[ -x /usr/sbin/nft || -x /sbin/nft ]]; then
+        "$BIN_DIR/ipctl" ensure >/dev/null \
+            && log "nft table inet bo_guard ready" \
+            || log "warning: ipctl ensure failed — per-IP blocking unavailable until it succeeds"
+    fi
+}
+
+crowdsec_installed_version() {
+    # `cscli version` prints a multi-line block whose first line is
+    # "version: v1.6.3-rpm-..." — extract just the number, same shape
+    # version_ge expects.
+    cscli version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+# CrowdSec is not in any distro's base repos; upstream publishes a repo-setup
+# script (the same one their docs tell you to curl). Installed with a LOCAL
+# LAPI: no --api-url, no enrollment — each host is its own decision authority.
+# That is the standalone topology this deployment chose, and it means a
+# blocklist learned on one box does NOT propagate to the others; selfApi is
+# what gives the fleet-wide view, by reading each host's decisions.
+install_crowdsec() {
+    log "installing CrowdSec (standalone LAPI) + nftables firewall bouncer"
+    if have apt-get; then
+        curl -fsSL https://install.crowdsec.net | bash \
+            || log "warning: crowdsec repo setup script failed — trying distro packages anyway"
+        apt-get update -y
+        apt-get install -y crowdsec crowdsec-firewall-bouncer-nftables
+    elif have dnf; then
+        curl -fsSL https://install.crowdsec.net | bash \
+            || log "warning: crowdsec repo setup script failed — trying distro packages anyway"
+        dnf install -y crowdsec crowdsec-firewall-bouncer-nftables
+    elif have yum; then
+        curl -fsSL https://install.crowdsec.net | bash \
+            || log "warning: crowdsec repo setup script failed — trying distro packages anyway"
+        yum install -y crowdsec crowdsec-firewall-bouncer-nftables
+    else
+        die "no supported package manager found (apt-get/dnf/yum) to install crowdsec"
+    fi
+}
+
+# Idempotent per the file's doctrine: "se já existe, valida e segue".
+#
+# Skipped unless --with-crowdsec. When it does run and the install fails, it
+# logs and returns instead of dying: CrowdSec is an addition to a host that is
+# already provisioned and working, and failing the whole run over it would
+# leave the operator with no agent and no deploy target over an optional
+# component.
+step_crowdsec() {
+    if (( ! WITH_CROWDSEC )); then
+        log "crowdsec: not requested (--with-crowdsec absent) — skipping"
+        return 0
+    fi
+
+    if have cscli; then
+        log "crowdsec $(crowdsec_installed_version) already installed — validating"
+    else
+        install_crowdsec || { log "warning: crowdsec install failed — continuing without it"; return 0; }
+    fi
+    have cscli || { log "warning: cscli still not present after install — continuing without crowdsec"; return 0; }
+
+    local collections="$CROWDSEC_COLLECTIONS"
+    if [[ "$MODE" == "lb" ]]; then
+        collections+=" crowdsecurity/nginx"
+    fi
+    local c
+    for c in $collections; do
+        if cscli collections list -o raw 2>/dev/null | grep -q "^${c},"; then
+            log "crowdsec collection $c already enabled"
+        else
+            cscli collections install "$c" >/dev/null 2>&1 \
+                && log "crowdsec collection $c installed" \
+                || log "warning: could not install crowdsec collection $c"
+        fi
+    done
+
+    systemctl enable --now crowdsec.service 2>/dev/null \
+        || log "warning: could not enable crowdsec.service"
+    # The bouncer is what actually drops packets; crowdsec alone only decides.
+    # Its package registers its own API key with the local LAPI on install, so
+    # there is nothing to wire up here beyond starting it.
+    systemctl enable --now crowdsec-firewall-bouncer.service 2>/dev/null \
+        || log "warning: could not enable crowdsec-firewall-bouncer.service — decisions will be recorded but never enforced"
+
+    # Reload so the collections just installed are actually parsing.
+    systemctl reload crowdsec.service 2>/dev/null || true
+    log "crowdsec ready ($(crowdsec_installed_version), standalone LAPI)"
 }
 
 install_docker() {
@@ -782,6 +962,7 @@ EOF
     open_firewalld_port 443 tcp
     ensure_selinux_compat /etc/nginx "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR"
     install_swapctl
+    install_ipctl
 
     nginx -t || die "nginx -t failed after installing template/snippets/catch-all"
 }
@@ -811,6 +992,7 @@ step4_config_agent() {
 
     write_agent_env
     install_swapctl
+    install_ipctl
 }
 
 # Shared by agent mode's step 4 and lb mode's extra agent install: writes the
@@ -820,6 +1002,10 @@ step4_config_agent() {
 write_agent_env() {
     mkdir -p /etc/deployer-lb-agent
     umask 077
+    local AGENT_UNITS_LIST="${AGENT_UNITS:-}"
+    if (( WITH_CROWDSEC )); then
+        AGENT_UNITS_LIST="${AGENT_UNITS_LIST:+${AGENT_UNITS_LIST},}crowdsec,crowdsec-firewall-bouncer"
+    fi
     cat > /etc/deployer-lb-agent/.env <<EOF
 INTAKE_URL=${INTAKE_URL}
 AGENT_ID=${AGENT_ID}
@@ -834,6 +1020,21 @@ AGENT_BUFFER_DIR=/var/lib/deployer-lb-agent/buffer
 # host with dozens of containers where it competes with AGENT_INTERVAL; the
 # report then ships the container inventory without usage numbers.
 AGENT_DOCKER_STATS=${AGENT_DOCKER_STATS}
+# How often the agent re-reads the nft guard sets and CrowdSec decisions.
+# Written explicitly, like AGENT_DOCKER_STATS above, because the tradeoff is
+# not obvious: this is a security-state read, not a metric, and running it at
+# AGENT_INTERVAL (8s) would shell out to nft and cscli ~10k times a day to
+# report a value that changes when an operator clicks a button. The report
+# still ships the section every tick — the cached one between refreshes — so
+# the payload shape never oscillates.
+AGENT_SECURITY_INTERVAL=${AGENT_SECURITY_INTERVAL}
+# Extra units reported in detail on top of the `deployer-` prefix (which
+# already covers deployer-lb-agent/-server/-guard). CrowdSec's two units are
+# named for CrowdSec, not for us, so they have to be listed by hand — and
+# they are exactly the pair whose state the security panel needs: crowdsec
+# DECIDES, crowdsec-firewall-bouncer ENFORCES, and only one of them being up
+# is a silent hole.
+AGENT_UNITS=${AGENT_UNITS_LIST}
 EOF
     chmod 600 /etc/deployer-lb-agent/.env
     log "wrote /etc/deployer-lb-agent/.env (mode 600, not in any repo)"
@@ -975,6 +1176,7 @@ main() {
             step4_config_lb
             step5_systemd_lb
             step_lb_agent
+            step_crowdsec
             step6_validate_lb
             ;;
         agent)
@@ -983,6 +1185,7 @@ main() {
             step3_binary_agent
             step4_config_agent
             step5_systemd_agent
+            step_crowdsec
             step6_validate_agent
             ;;
     esac

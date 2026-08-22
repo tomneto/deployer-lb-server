@@ -41,6 +41,78 @@ type Report struct {
 	// sections as optional.
 	DiskIO      DiskIOInfo      `json:"disk_io"`
 	Connections ConnectionsInfo `json:"connections"`
+	// Security is the IP-guard/CrowdSec section: what this host is CURRENTLY
+	// enforcing, so the backoffice can diff it against what it declared and
+	// show drift instead of assuming a rule it wrote is still in place. A
+	// pointer, and omitted when nil, because unlike every section above it is
+	// refreshed on its own slow cadence (see cmd/agent's securityCache) rather
+	// than every tick — nil means "this agent never managed to read it", which
+	// is a different statement from OK:false ("we read it and it failed").
+	Security *SecurityInfo `json:"security,omitempty"`
+}
+
+// SecurityInfo is the observed state of the two independent enforcement
+// mechanisms on this host. They are reported side by side and never merged:
+// bo_guard holds what an operator declared through the backoffice, CrowdSec
+// holds what its own scenarios decided. An IP appearing in one and not the
+// other is information, not an inconsistency.
+type SecurityInfo struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// CollectedAt is when the underlying commands actually ran, which is NOT
+	// the report timestamp: this section is cached between refreshes, so a
+	// consumer that needs to know how stale it is has to be told explicitly.
+	CollectedAt string       `json:"collected_at,omitempty"`
+	Guard       GuardInfo    `json:"guard"`
+	CrowdSec    CrowdSecInfo `json:"crowdsec"`
+}
+
+// GuardInfo mirrors `ipctl list`: the contents of the four sets in the
+// `inet bo_guard` nftables table. Empty slices rather than nil so a consumer
+// can tell "the set is empty" from "we could not read it" (the latter is
+// TablePresent:false or OK:false).
+type GuardInfo struct {
+	// NftPresent false means the nftables binary is missing entirely, so
+	// per-IP blocking is unavailable on this host — a different problem from
+	// the table simply not having been created yet.
+	NftPresent   bool     `json:"nft_present"`
+	IpctlPresent bool     `json:"ipctl_present"`
+	TablePresent bool     `json:"table_present"`
+	BlockV4      []string `json:"block_v4"`
+	BlockV6      []string `json:"block_v6"`
+	AllowV4      []string `json:"allow_v4"`
+	AllowV6      []string `json:"allow_v6"`
+}
+
+// CrowdSecInfo is `cscli decisions list` plus enough context to explain an
+// empty list: no CrowdSec at all, CrowdSec running with nothing to ban, or
+// CrowdSec deciding while its bouncer is dead and nothing is enforced.
+type CrowdSecInfo struct {
+	Installed bool   `json:"installed"`
+	Version   string `json:"version,omitempty"`
+	// Running/BouncerRunning are separate on purpose: crowdsec DECIDES and the
+	// bouncer ENFORCES. A host with decisions and a stopped bouncer looks
+	// protected in `cscli` and is wide open in the kernel — the single most
+	// misleading state this section exists to surface.
+	Running        bool         `json:"running"`
+	BouncerRunning bool         `json:"bouncer_running"`
+	Decisions      []CSDecision `json:"decisions,omitempty"`
+	Truncated      bool         `json:"truncated,omitempty"`
+}
+
+// CSDecision is one active CrowdSec decision, flattened to the fields the
+// backoffice renders. Origin distinguishes a local scenario hit ("crowdsec")
+// from a community blocklist pull ("lists"/"CAPI") from a manual `cscli
+// decisions add` ("cscli") — which matters, because only the manual ones are
+// ours to promote into a permanent rule.
+type CSDecision struct {
+	ID       int64  `json:"id,omitempty"`
+	Value    string `json:"value"`
+	Scope    string `json:"scope"`
+	Type     string `json:"type"`
+	Scenario string `json:"scenario,omitempty"`
+	Origin   string `json:"origin,omitempty"`
+	Duration string `json:"duration,omitempty"`
 }
 
 // DiskIOInfo carries per-device block I/O counters. Values are CUMULATIVE
