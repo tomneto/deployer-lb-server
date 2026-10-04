@@ -239,6 +239,29 @@ func TestParseMdMember(t *testing.T) {
 	}
 }
 
+func TestIsSmartCandidate(t *testing.T) {
+	// Encontrado rodando no host real: oito loopbacks de snap e o md0
+	// entraram no inventário de discos e renderizariam nove cards de
+	// "sem SMART" que nunca poderiam ter SMART.
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"sda", true}, {"sdb", true}, {"nvme0n1", true},
+		{"vda", true}, {"mmcblk0", true},
+		{"loop0", false}, {"loop7", false},
+		{"md0", false}, {"md127", false},
+		{"ram0", false}, {"zram0", false},
+		{"sr0", false}, {"fd0", false}, {"dm-0", false},
+		{"sda1", false}, {"nvme0n1p1", false},
+	}
+	for _, tt := range tests {
+		if got := isSmartCandidate(tt.name); got != tt.want {
+			t.Errorf("isSmartCandidate(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestStorageCacheThrottles(t *testing.T) {
 	// The cache IS the throttle that keeps smartctl off the disks every 8s,
 	// so "how many times did we shell out" is the actual assertion.

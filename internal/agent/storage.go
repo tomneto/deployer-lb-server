@@ -89,9 +89,38 @@ func collectStorage(run Runner, now time.Time) StorageInfo {
 	return info
 }
 
-// listBlockDevices returns the whole physical disks under /sys/block, reusing
-// isPhysicalDiskKey so this list and the disk_io list can never disagree about
-// what counts as a disk.
+// pseudoDiskPrefixes are block devices that exist in /sys/block but are not
+// media anyone can ask for health about: squashfs/snap loopbacks, ramdisks,
+// optical and floppy nodes, and device-mapper volumes (whose health belongs
+// to the physical disk underneath).
+var pseudoDiskPrefixes = []string{"loop", "ram", "zram", "sr", "fd", "dm-"}
+
+// isSmartCandidate reports whether a /sys/block entry is a real drive worth
+// asking SMART about.
+//
+// Deliberately NOT isPhysicalDiskKey, even though that function is right next
+// door and also answers "is this a whole disk". It serves disk_io, where
+// grouping I/O under "loop3" and "md0" is correct, and where its patterns are
+// mirrored in selfApi's infra.py on purpose. Reusing it here put eight snap
+// loopbacks and an md array into the disk inventory of a real host — nine
+// rows that can never have SMART, rendering as nine "no SMART" cards.
+//
+// md arrays are excluded because they are reported separately under `raid`;
+// listing md0 as a disk too would show the same thing twice, once with every
+// health field empty.
+func isSmartCandidate(name string) bool {
+	for _, p := range pseudoDiskPrefixes {
+		if strings.HasPrefix(name, p) {
+			return false
+		}
+	}
+	if strings.HasPrefix(name, "md") {
+		return false
+	}
+	return isPhysicalDiskKey(name)
+}
+
+// listBlockDevices returns the real drives under /sys/block.
 func listBlockDevices() ([]string, error) {
 	entries, err := os.ReadDir(sysBlockDir)
 	if err != nil {
@@ -99,7 +128,7 @@ func listBlockDevices() ([]string, error) {
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if isPhysicalDiskKey(e.Name()) {
+		if isSmartCandidate(e.Name()) {
 			names = append(names, e.Name())
 		}
 	}
