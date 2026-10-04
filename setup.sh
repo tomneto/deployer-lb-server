@@ -344,7 +344,39 @@ step1_deps_lb() {
         fi
     fi
     ensure_wireguard_tools_version
+    ensure_storage_tools
     have systemctl || die "systemd (systemctl) not found — required for both modes"
+}
+
+# smartmontools/mdadm back the agent's `storage` report section (disk health
+# and md array state). Deliberately NON-FATAL, unlike every other dependency
+# here: a VPS with virtio disks has no SMART to read and no arrays to watch,
+# and refusing to provision it over a monitoring nicety would be absurd. The
+# agent already reports the section as unavailable when the binaries are
+# missing, so the honest degraded state is one log line away.
+ensure_storage_tools() {
+    local missing=()
+    have smartctl || missing+=("smartmontools")
+    have mdadm    || missing+=("mdadm")
+    if (( ${#missing[@]} == 0 )); then
+        log "smartmontools and mdadm already installed, OK"
+        return 0
+    fi
+    log "installing storage health tools: ${missing[*]}"
+    if have apt-get; then
+        # DEBIAN_FRONTEND: the mdadm package asks about boot-degraded arrays
+        # on Debian/Ubuntu and would hang a non-interactive provision forever.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    elif have dnf; then
+        dnf install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    elif have yum; then
+        yum install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    else
+        log "warning: no supported package manager to install ${missing[*]} — the storage section will report unavailable"
+    fi
 }
 
 # Small/free-tier VMs (the common target for this script) can have as
@@ -612,7 +644,7 @@ install_docker() {
 }
 
 step1_deps_agent() {
-    log "step 1/6: dependencies (docker, wireguard-tools)"
+    log "step 1/6: dependencies (docker, wireguard-tools, smartmontools, mdadm)"
     if (( SKIP_DOCKER )); then
         log "--skip-docker set — leaving docker install to a separate step (or skipping if this target won't run docker-runtime pipelines)"
     elif (( !WITH_DOCKER && RAM_TOTAL_MB > 0 && RAM_TOTAL_MB < DOCKER_MIN_RAM_MB )); then
@@ -624,7 +656,39 @@ step1_deps_agent() {
     fi
 
     ensure_wireguard_tools_version
+    ensure_storage_tools
     have systemctl || die "systemd (systemctl) not found — required for both modes"
+}
+
+# smartmontools/mdadm back the agent's `storage` report section (disk health
+# and md array state). Deliberately NON-FATAL, unlike every other dependency
+# here: a VPS with virtio disks has no SMART to read and no arrays to watch,
+# and refusing to provision it over a monitoring nicety would be absurd. The
+# agent already reports the section as unavailable when the binaries are
+# missing, so the honest degraded state is one log line away.
+ensure_storage_tools() {
+    local missing=()
+    have smartctl || missing+=("smartmontools")
+    have mdadm    || missing+=("mdadm")
+    if (( ${#missing[@]} == 0 )); then
+        log "smartmontools and mdadm already installed, OK"
+        return 0
+    fi
+    log "installing storage health tools: ${missing[*]}"
+    if have apt-get; then
+        # DEBIAN_FRONTEND: the mdadm package asks about boot-degraded arrays
+        # on Debian/Ubuntu and would hang a non-interactive provision forever.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    elif have dnf; then
+        dnf install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    elif have yum; then
+        yum install -y "${missing[@]}" \
+            || log "warning: could not install ${missing[*]} — the storage section will report unavailable"
+    else
+        log "warning: no supported package manager to install ${missing[*]} — the storage section will report unavailable"
+    fi
 }
 
 download_or_build_binary() {

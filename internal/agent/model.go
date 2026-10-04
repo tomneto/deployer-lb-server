@@ -49,6 +49,12 @@ type Report struct {
 	// than every tick — nil means "this agent never managed to read it", which
 	// is a different statement from OK:false ("we read it and it failed").
 	Security *SecurityInfo `json:"security,omitempty"`
+	// Storage is the physical-media section: the disks themselves (model,
+	// serial, SMART) and the md arrays built on top of them. Additive and
+	// optional like everything above it, with one extra wrinkle: it is the
+	// only section that is NOT refreshed every tick (see StorageCache), so a
+	// consumer must read its own timestamp rather than the report's.
+	Storage StorageInfo `json:"storage"`
 }
 
 // SecurityInfo is the observed state of the two independent enforcement
@@ -138,13 +144,110 @@ type DiskDevice struct {
 	IoTimeMs   uint64 `json:"io_time_ms"`
 }
 
+// StorageInfo is the physical-media census: what disks exist, how healthy
+// they say they are, and which md arrays they back. Distinct from DiskIOInfo
+// (throughput) and from ServerInfo.Disks (filesystem usage) — a disk that is
+// dying shows nothing unusual in either of those.
+//
+// CollectedAt is the section's own timestamp because StorageCache refreshes
+// it far more slowly than the report interval; without it a consumer would
+// read a 15-minute-old temperature as if it were current.
+type StorageInfo struct {
+	OK          bool          `json:"ok"`
+	Error       string        `json:"error,omitempty"`
+	CollectedAt string        `json:"collected_at,omitempty"`
+	Disks       []StorageDisk `json:"disks,omitempty"`
+	Raid        []RaidArray   `json:"raid,omitempty"`
+}
+
+// StorageDisk is one whole physical disk as the kernel names it in
+// /sys/block. Name matches DiskDevice.Device, which is the join key the
+// frontend uses to put throughput and health on the same row.
+type StorageDisk struct {
+	Name       string     `json:"name"`
+	Model      string     `json:"model,omitempty"`
+	Serial     string     `json:"serial,omitempty"`
+	SizeBytes  uint64     `json:"size_bytes,omitempty"`
+	Rotational *bool      `json:"rotational,omitempty"`
+	Smart      *SmartInfo `json:"smart,omitempty"`
+}
+
+// SmartInfo is the subset of `smartctl --json` worth shipping every cycle.
+//
+// Available/Enabled are reported separately on purpose: a disk with SMART
+// available but DISABLED is the exact situation that left vault.local blind,
+// and it is actionable (smartctl -s on) in a way that "no SMART" is not.
+type SmartInfo struct {
+	Available bool `json:"available"`
+	Enabled   bool `json:"enabled"`
+	// HealthPassed is nil when the overall-health self-assessment could not be
+	// read at all — distinct from false, which means the drive FAILED it.
+	HealthPassed *bool           `json:"health_passed,omitempty"`
+	PowerOnHours *uint64         `json:"power_on_hours,omitempty"`
+	TemperatureC *int            `json:"temperature_c,omitempty"`
+	Attributes   SmartAttributes `json:"attributes"`
+	LastSelfTest *SmartSelfTest  `json:"last_selftest,omitempty"`
+}
+
+// SmartAttributes carries only the handful of vendor attributes that mean the
+// same thing across drives, as RAW counts. Every field is a pointer because
+// "the drive does not expose this attribute" and "the attribute is zero" are
+// different answers, and collapsing them would turn a missing counter into a
+// clean bill of health.
+//
+// Deliberately NOT included: temperature (id 194) and wear (id 230), whose RAW
+// values are vendor-packed bitfields — a real WD Blue reports 317827579940 for
+// 194. Temperature comes from the top-level `temperature.current` instead, and
+// wear from the NORMALIZED value, not the raw one.
+type SmartAttributes struct {
+	Reallocated *uint64 `json:"reallocated,omitempty"`
+	Pending     *uint64 `json:"pending,omitempty"`
+	CrcErrors   *uint64 `json:"crc_errors,omitempty"`
+	WearPercent *int    `json:"wear_percent,omitempty"`
+}
+
+// SmartSelfTest is the most recent entry of the self-test log, so the UI can
+// show the outcome of a test it triggered without polling smartctl itself.
+type SmartSelfTest struct {
+	Type         string  `json:"type,omitempty"`
+	Status       string  `json:"status,omitempty"`
+	Passed       *bool   `json:"passed,omitempty"`
+	PowerOnHours *uint64 `json:"power_on_hours,omitempty"`
+}
+
+// RaidArray is one md device from /proc/mdstat.
+//
+// HasRedundancy is a first-class field rather than something the consumer
+// derives from Level: a raid0 that is perfectly "active" still means total
+// loss if one member dies, and that is precisely the state nothing was
+// reporting. It is not an error, so it is surfaced as information, not failure.
+type RaidArray struct {
+	Device        string `json:"device"`
+	Level         string `json:"level,omitempty"`
+	State         string `json:"state,omitempty"`
+	Degraded      bool   `json:"degraded"`
+	HasRedundancy bool   `json:"has_redundancy"`
+	// ActiveDevices/TotalDevices come from the "[n/m]" marker, which only
+	// redundant levels print. Both are 0 for raid0/linear.
+	ActiveDevices int          `json:"active_devices"`
+	TotalDevices  int          `json:"total_devices"`
+	Members       []RaidMember `json:"members,omitempty"`
+}
+
+// RaidMember is one disk inside an array. Name matches StorageDisk.Name.
+type RaidMember struct {
+	Name   string `json:"name"`
+	Role   int    `json:"role"`
+	Failed bool   `json:"failed"`
+	Spare  bool   `json:"spare"`
+}
+
 // ConnectionsInfo is the socket census: AGGREGATE COUNTS plus two bounded
 // drill-downs. A busy host has tens of thousands of sockets and the full
 // listing would dwarf the rest of the report, so the tuples never ship whole —
 // TopPorts answers "which service is being hit" and Peers answers "which
 // remote addresses are hitting it", both computed over every socket and only
-// then truncated.
-//
+// then truncated.//
 // Inbound/outbound follow the central's own classification
 // (infra._classify_connections): an ESTABLISHED socket whose LOCAL port is one
 // we also listen on is inbound (someone dialed us); anything else established

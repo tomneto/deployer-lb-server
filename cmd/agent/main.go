@@ -49,8 +49,17 @@ func main() {
 		dockerStats      = flag.Bool("docker-stats", envBoolOr("AGENT_DOCKER_STATS", true), "collect per-container stats via `docker stats --no-stream` (expensive on hosts with many containers)")
 		dockerStatsLimit = flag.Duration("docker-stats-timeout", envDurationOr("AGENT_DOCKER_STATS_TIMEOUT", 5*time.Second), "hard deadline for the `docker stats` call; past it the report ships without per-container stats")
 		securityInterval = flag.Duration("security-interval", envDurationOr("AGENT_SECURITY_INTERVAL", 60*time.Second), "how often to re-read the nft ip guard and CrowdSec decisions; the cached value ships on every report in between")
-		showVerS         = flag.Bool("v", false, "print version and exit")
-		showVerL         = flag.Bool("version", false, "print version and exit")
+		// SMART is the one collector that touches the drives themselves, so it
+		// runs on its own slow clock instead of the report interval: polling a
+		// disk every 8s is pointless (power-on hours do not move) and on a
+		// spun-down HDD each call can wake the platter. Off-switch included
+		// for hosts where smartctl is absent or the controller mishandles the
+		// SAT passthrough.
+		smart         = flag.Bool("smart", envBoolOr("AGENT_SMART", true), "collect SMART health and md array status (requires smartmontools)")
+		smartInterval = flag.Duration("smart-interval", envDurationOr("AGENT_SMART_INTERVAL", 15*time.Minute), "how often to re-read SMART; the cached section is re-sent in between")
+		smartTimeout  = flag.Duration("smart-timeout", envDurationOr("AGENT_SMART_TIMEOUT", 20*time.Second), "hard deadline for each smartctl call")
+		showVerS      = flag.Bool("v", false, "print version and exit")
+		showVerL      = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -107,7 +116,11 @@ func main() {
 		// Like procCache, this must outlive a single tick — it is what makes
 		// the security section cheap enough to ship every 8 seconds.
 		secCache: newSecurityCache(*securityInterval),
-	})
+		// Same reasoning as procCache: the cache IS the throttle, so it has to
+		// outlive the tick that created it.
+		smart:        *smart,
+		smartTimeout: *smartTimeout,
+		storageCache: agent.NewStorageCache(*smartInterval)})
 
 	log.Println("deployer-lb-agent stopped")
 }
@@ -126,6 +139,9 @@ type loopConfig struct {
 	dockerStats   bool
 	statsTimeout  time.Duration
 	secCache      *securityCache
+	smart         bool
+	smartTimeout  time.Duration
+	storageCache  *agent.StorageCache
 }
 
 // securityCache throttles CollectSecurity to its own interval.
@@ -238,6 +254,16 @@ func buildReport(cfg loopConfig) agent.Report {
 	}
 	systemd := agent.CollectSystemd(agent.ExecRunner, cfg.managedPrefix, cfg.extraUnits)
 
+	// Storage is cached behind its own TTL, so this is a cheap map lookup on
+	// almost every tick. The deadline matters only on the tick that actually
+	// refreshes: smartctl on a sleeping disk or a flaky SAT bridge can hang
+	// far longer than the report interval, and a late report is worse than a
+	// missing section.
+	var storage agent.StorageInfo
+	if cfg.smart {
+		storage = cfg.storageCache.Collect(agent.TimeoutRunner(cfg.smartTimeout), now)
+	}
+
 	pinned := append(ports.PortPIDs(), systemd.ManagedPIDs()...)
 	pinned = append(pinned, docker.ContainerPIDs()...)
 
@@ -265,7 +291,11 @@ func buildReport(cfg loopConfig) agent.Report {
 		Connections: connections,
 		// Refreshed on its own slow cadence — see securityCache.
 		Security: cfg.secCache.get(now),
-	}
+		// Physical media. Unlike every other section this one is usually a
+		// CACHED value (StorageCache), which is why it carries its own
+		// collected_at: a 15-minute-old temperature must not read as current
+		// just because the report around it is fresh.
+		Storage: storage}
 }
 
 // envBoolOr reads a boolean env var accepting the spellings ops actually write
