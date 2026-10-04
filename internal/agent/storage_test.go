@@ -121,18 +121,27 @@ func TestReadSmartIgnoresExitCode(t *testing.T) {
 	run := func(string, ...string) ([]byte, error) {
 		return []byte(wdBlueSmartJSON), errors.New("exit status 4")
 	}
-	info := readSmart(run, "sdb")
+	info, identity := readSmart(run, "sdb")
 	if info == nil {
 		t.Fatal("readSmart() = nil despite valid JSON on stdout")
 	}
 	if info.Attributes.CrcErrors == nil || *info.Attributes.CrcErrors != 32 {
 		t.Errorf("CrcErrors = %v, want 32", info.Attributes.CrcErrors)
 	}
+	// sysfs publishes device/serial only for NVMe, so on a SATA host this is
+	// the only place the serial comes from — and it is the field that tells
+	// two identical disks apart when the UI says "replace this one".
+	if identity.Serial != "173964801850" {
+		t.Errorf("identity.Serial = %q, want 173964801850", identity.Serial)
+	}
+	if identity.Model != "WDC WDS240G1G0A-00SS50" {
+		t.Errorf("identity.Model = %q, want the WD Blue model", identity.Model)
+	}
 }
 
 func TestReadSmartWithoutBinary(t *testing.T) {
 	run := func(string, ...string) ([]byte, error) { return nil, errors.New("executable file not found") }
-	if got := readSmart(run, "sda"); got != nil {
+	if got, _ := readSmart(run, "sda"); got != nil {
 		t.Errorf("readSmart() = %+v, want nil when smartctl is absent", got)
 	}
 }

@@ -159,7 +159,15 @@ func readDisk(run Runner, name string) StorageDisk {
 		t := true
 		d.Rotational = &t
 	}
-	d.Smart = readSmart(run, name)
+	smart, identity := readSmart(run, name)
+	d.Smart = smart
+	// sysfs wins when it has an answer; smartctl fills the (common) gap.
+	if d.Serial == "" {
+		d.Serial = identity.Serial
+	}
+	if d.Model == "" {
+		d.Model = identity.Model
+	}
 	return d
 }
 
@@ -170,24 +178,48 @@ func readDisk(run Runner, name string) StorageDisk {
 // error in the past", which still come with perfectly good JSON on stdout. So
 // the exit code is ignored entirely and the parse decides — otherwise a disk
 // with any historical error would silently report no SMART at all.
-func readSmart(run Runner, name string) *SmartInfo {
+func readSmart(run Runner, name string) (*SmartInfo, smartIdentity) {
 	if run == nil {
 		run = ExecRunner
 	}
 	out, _ := run("smartctl", "--json=c", "-x", "/dev/"+name)
 	if len(out) == 0 {
-		return nil
+		return nil, smartIdentity{}
 	}
 	info, err := parseSmart(out)
 	if err != nil {
-		return nil
+		return nil, smartIdentity{}
 	}
-	return info
+	return info, parseIdentity(out)
+}
+
+// smartIdentity is what smartctl knows about which drive this is, as opposed
+// to how healthy it is.
+type smartIdentity struct {
+	Model  string
+	Serial string
+}
+
+func parseIdentity(raw []byte) smartIdentity {
+	var o smartctlOutput
+	if err := json.Unmarshal(raw, &o); err != nil {
+		return smartIdentity{}
+	}
+	return smartIdentity{
+		Model:  strings.TrimSpace(o.ModelName),
+		Serial: strings.TrimSpace(o.SerialNumber),
+	}
 }
 
 // smartctlOutput mirrors only the fields the report needs. smartctl's schema
 // is large, versioned, and mostly vendor trivia.
 type smartctlOutput struct {
+	// Identity fields: sysfs only publishes device/serial for NVMe, so on a
+	// SATA host these are the only place the serial comes from — and the
+	// serial is what tells two identical disks apart when the UI says
+	// "replace this one".
+	ModelName    string `json:"model_name"`
+	SerialNumber string `json:"serial_number"`
 	SmartSupport *struct {
 		Available bool `json:"available"`
 		Enabled   bool `json:"enabled"`
