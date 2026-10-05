@@ -59,21 +59,26 @@ func CollectServer(mountPoints []string) ServerInfo {
 		}
 	}
 
-	if len(mountPoints) == 0 {
-		mountPoints = []string{"/"}
-	}
-	for _, mp := range mountPoints {
-		usage, err := disk.Usage(mp)
+	for _, part := range filesystemsToReport(mountPoints) {
+		usage, err := disk.Usage(part.Mountpoint)
 		if err != nil {
-			info.OK = false
-			info.Error = appendErr(info.Error, "disk("+mp+"): "+err.Error())
+			// Not info.OK = false: a single unreadable mount (a stale NFS
+			// handle, a container-only path) is normal on a real box once we
+			// enumerate instead of being told what to look at. Marking the
+			// whole server reading bad because one mount is gone would make
+			// the honest upgrade to discovery look like a regression.
+			info.Error = appendErr(info.Error, "disk("+part.Mountpoint+"): "+err.Error())
 			continue
 		}
 		info.Disks = append(info.Disks, DiskInfo{
-			MountPoint:  mp,
+			MountPoint:  part.Mountpoint,
 			TotalBytes:  usage.Total,
 			UsedBytes:   usage.Used,
 			UsedPercent: usage.UsedPercent,
+			FreeBytes:   usage.Free,
+			Device:      part.Device,
+			DiskDevice:  physicalDisk(part.Device),
+			FSType:      part.Fstype,
 		})
 	}
 
@@ -110,6 +115,10 @@ func CollectServer(mountPoints []string) ServerInfo {
 				PacketsRecv: c.PacketsRecv,
 				Errin:       c.Errin,
 				Errout:      c.Errout,
+				DropIn:      c.Dropin,
+				DropOut:     c.Dropout,
+				FifoIn:      c.Fifoin,
+				FifoOut:     c.Fifoout,
 			})
 		}
 	}

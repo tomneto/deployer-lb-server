@@ -49,6 +49,13 @@ type Report struct {
 	// than every tick — nil means "this agent never managed to read it", which
 	// is a different statement from OK:false ("we read it and it failed").
 	Security *SecurityInfo `json:"security,omitempty"`
+	// NetLink is the link-health section: negotiated speed against what the
+	// card supports, the error/discard counters, which NICs share a subnet,
+	// and where the receive interrupts land. Additive and optional like every
+	// section above it. A pointer for the same reason Security is one: nil
+	// means "this agent never collected it" (an older build, or the section
+	// switched off), which is a different statement from OK:false.
+	NetLink *NetLinkInfo `json:"netlink,omitempty"`
 	// Storage is the physical-media section: the disks themselves (model,
 	// serial, SMART) and the md arrays built on top of them. Additive and
 	// optional like everything above it, with one extra wrinkle: it is the
@@ -341,6 +348,14 @@ type LoadInfo struct {
 }
 
 // NetIOInfo carries cumulative per-interface counters (C3 `server.network`).
+//
+// Drop/FIFO sit next to the error counters because they answer a different
+// question and the two get confused constantly: `errin` is a malformed frame
+// (the wire is bad), while `drop_in`/`fifo_in` mean the frame arrived intact
+// and the host threw it away for lack of a descriptor or ring space (the
+// receiver is bad). A link diagnosis that cannot tell those apart ends up
+// blaming the cable for what is a tuning problem — gopsutil already carries
+// all four, so the only cost here is shipping them.
 type NetIOInfo struct {
 	Iface       string `json:"iface"`
 	BytesSent   uint64 `json:"bytes_sent"`
@@ -349,6 +364,10 @@ type NetIOInfo struct {
 	PacketsRecv uint64 `json:"packets_recv"`
 	Errin       uint64 `json:"errin"`
 	Errout      uint64 `json:"errout"`
+	DropIn      uint64 `json:"drop_in"`
+	DropOut     uint64 `json:"drop_out"`
+	FifoIn      uint64 `json:"fifo_in"`
+	FifoOut     uint64 `json:"fifo_out"`
 }
 
 type CPUInfo struct {
@@ -367,11 +386,35 @@ type MemoryInfo struct {
 	SwapUsedPercent float64 `json:"swap_used_percent"`
 }
 
+// DiskInfo is one mounted filesystem.
+//
+// The last four fields exist so a consumer can CHOOSE a filesystem, not just
+// watch one fill up. Picking a backup destination needs all of them:
+//
+//   - Device/DiskDevice answer "is this the same physical disk the data is
+//     on?". Writing a backup next to the thing it protects is the mistake the
+//     whole feature exists to prevent, and the mount point alone cannot tell:
+//     /db and /backup can be two directories on one SSD.
+//   - FSType flags the filesystems that silently discard Unix ownership
+//     (vfat/exfat/ntfs). A chown there "succeeds" and does not persist, so the
+//     honest move is to warn instead of pretending to fix it.
+//   - FreeBytes is NOT Total-Used: ext4 reserves ~5% for root, so the
+//     difference overstates what an unprivileged writer can actually use.
+//
+// Names deliberately mirror selfApi's local psutil collector
+// (api/services/backoffice/infra.py `_disks_sync`) rather than this struct's
+// own `*_bytes` convention, because `normalizeDisk` in the frontend passes
+// unknown keys through verbatim — matching the local names is what makes one
+// disk picker work against both a local host and a remote agent.
 type DiskInfo struct {
 	MountPoint  string  `json:"mount_point"`
 	TotalBytes  uint64  `json:"total_bytes"`
 	UsedBytes   uint64  `json:"used_bytes"`
 	UsedPercent float64 `json:"used_percent"`
+	FreeBytes   uint64  `json:"free_bytes"`
+	Device      string  `json:"device,omitempty"`
+	DiskDevice  string  `json:"disk_device,omitempty"`
+	FSType      string  `json:"fstype,omitempty"`
 }
 
 // DockerInfo is the container inventory, collected via `docker ps`/`docker

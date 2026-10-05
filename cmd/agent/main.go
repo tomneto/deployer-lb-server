@@ -58,6 +58,8 @@ func main() {
 		smart         = flag.Bool("smart", envBoolOr("AGENT_SMART", true), "collect SMART health and md array status (requires smartmontools)")
 		smartInterval = flag.Duration("smart-interval", envDurationOr("AGENT_SMART_INTERVAL", 15*time.Minute), "how often to re-read SMART; the cached section is re-sent in between")
 		smartTimeout  = flag.Duration("smart-timeout", envDurationOr("AGENT_SMART_TIMEOUT", 20*time.Second), "hard deadline for each smartctl call")
+		netlink       = flag.Bool("netlink", envBoolOr("AGENT_NETLINK", true), "collect link health: negotiated speed, error counters, subnets, interrupts")
+		netlinkFacts  = flag.Duration("netlink-facts-interval", envDurationOr("AGENT_NETLINK_FACTS_INTERVAL", 5*time.Minute), "how often to re-read the ethtool facts; counters are read every tick regardless")
 		showVerS      = flag.Bool("v", false, "print version and exit")
 		showVerL      = flag.Bool("version", false, "print version and exit")
 	)
@@ -120,7 +122,14 @@ func main() {
 		// outlive the tick that created it.
 		smart:        *smart,
 		smartTimeout: *smartTimeout,
-		storageCache: agent.NewStorageCache(*smartInterval)})
+		storageCache: agent.NewStorageCache(*smartInterval),
+		// Same reasoning as storageCache: the cache IS the throttle for the
+		// ethtool half, so it has to outlive the tick that created it. Unlike
+		// StorageCache it does NOT throttle the whole section — the counters
+		// are re-read every tick, because a cumulative error count is
+		// unreadable and only its delta between samples means anything.
+		netlink:      *netlink,
+		netlinkCache: agent.NewNetLinkCache(*netlinkFacts)})
 
 	log.Println("deployer-lb-agent stopped")
 }
@@ -142,6 +151,8 @@ type loopConfig struct {
 	smart         bool
 	smartTimeout  time.Duration
 	storageCache  *agent.StorageCache
+	netlink       bool
+	netlinkCache  *agent.NetLinkCache
 }
 
 // securityCache throttles CollectSecurity to its own interval.
@@ -264,6 +275,15 @@ func buildReport(cfg loopConfig) agent.Report {
 		storage = cfg.storageCache.Collect(agent.TimeoutRunner(cfg.smartTimeout), now)
 	}
 
+	// Link health. The ethtool half is cached behind its own TTL; the /proc
+	// and sysfs half is re-read here on every tick, which is the half that
+	// matters — the counters only mean something as a delta.
+	var netlink *agent.NetLinkInfo
+	if cfg.netlink {
+		collected := cfg.netlinkCache.Collect(agent.ExecRunner, now)
+		netlink = &collected
+	}
+
 	pinned := append(ports.PortPIDs(), systemd.ManagedPIDs()...)
 	pinned = append(pinned, docker.ContainerPIDs()...)
 
@@ -295,7 +315,12 @@ func buildReport(cfg loopConfig) agent.Report {
 		// CACHED value (StorageCache), which is why it carries its own
 		// collected_at: a 15-minute-old temperature must not read as current
 		// just because the report around it is fresh.
-		Storage: storage}
+		Storage: storage,
+		// Negotiated speed vs the card's capability, the error/discard
+		// counters, shared subnets and interrupt placement. Carries its own
+		// facts_at/counters_at because its two halves are collected on
+		// different clocks.
+		NetLink: netlink}
 }
 
 // envBoolOr reads a boolean env var accepting the spellings ops actually write
