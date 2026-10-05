@@ -55,6 +55,7 @@ type dockerInspectEntry struct {
 		// NetworkSettings.Ports below, which only describes what was actually
 		// PUBLISHED to the host — a container can expose a port nobody mapped.
 		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+		Labels       map[string]string   `json:"Labels"`
 	} `json:"Config"`
 	State struct {
 		Status string `json:"Status"`
@@ -151,6 +152,7 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 			c.Health = e.State.Health.Status
 		}
 		c.ExposedPorts = parseExposedPorts(e.Config.ExposedPorts)
+		c.Labels = ownershipLabels(e.Config.Labels)
 		c.NetworkMode = e.HostConfig.NetworkMode
 		c.Networks, c.IPAddress = parseNetworks(e.NetworkSettings.Networks)
 
@@ -173,6 +175,38 @@ func ParseDockerInspect(raw []byte) ([]Container, error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// ownershipLabels keeps only the labels that say WHO owns the container —
+// `bo.pipeline`, `bo.service`, `bo.database` — and drops everything else.
+//
+// The filter is the point. A compose-managed container carries a dozen labels
+// (project, config hash, working dir, the whole oneshot metadata), and shipping
+// all of them for every container on every 8s report would grow the payload for
+// nothing. Ownership is the only thing the backend asks the labels for.
+//
+// Why labels at all: until now the container↔pipeline link was pure name
+// convention, resolved by joining `resolve_services(pl)[].container_name`
+// against the report. That works and stays as the fallback — a container
+// started before this field existed has no label and will never get one until
+// its next deploy. The label is the sturdier path for the ones that do.
+//
+// Returns nil when there is nothing, so the field stays out of the JSON.
+func ownershipLabels(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for k, v := range raw {
+		if !strings.HasPrefix(k, "bo.") || v == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string, 3)
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // parseNetworks turns docker's `NetworkSettings.Networks` map into the sorted

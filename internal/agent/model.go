@@ -518,6 +518,14 @@ type Container struct {
 	NetworkMode string   `json:"network_mode,omitempty"`
 	Networks    []string `json:"networks,omitempty"`
 	IPAddress   string   `json:"ip_address,omitempty"`
+	// Labels carries ONLY the `bo.*` ownership labels (see ownershipLabels):
+	// which pipeline, which service of it, or which provisioned database this
+	// container belongs to. It is what lets the backend group resource usage
+	// per pipeline without re-deriving container names.
+	//
+	// Absent for any container that has not been deployed since the labels
+	// started being emitted — the name-based join remains the fallback.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // ContainerStats is one `docker stats` row, keyed by container ID in the map

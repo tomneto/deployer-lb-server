@@ -120,6 +120,53 @@ func TestParseDockerInspect_ReadsExposedPorts(t *testing.T) {
 	}
 }
 
+func TestParseDockerInspect_KeepsOnlyOwnershipLabels(t *testing.T) {
+	// Um container gerenciado pelo compose carrega uma dúzia de labels de
+	// metadado; só as de dono interessam, e mandar o resto a cada 8 segundos,
+	// para cada container, engorda o report sem servir para nada.
+	raw := []byte(`[{
+	  "Id": "abc123", "Name": "/api",
+	  "Config": {"Image": "api:1", "Labels": {
+	    "bo.pipeline": "pl_123",
+	    "bo.service": "api",
+	    "com.docker.compose.project": "workspacefy",
+	    "com.docker.compose.config-hash": "deadbeef",
+	    "maintainer": "alguem"
+	  }},
+	  "State": {"Status": "running"},
+	  "NetworkSettings": {"Ports": {}}
+	}]`)
+
+	got, err := ParseDockerInspect(raw)
+	if err != nil {
+		t.Fatalf("ParseDockerInspect() error = %v", err)
+	}
+	want := map[string]string{"bo.pipeline": "pl_123", "bo.service": "api"}
+	if !reflect.DeepEqual(got[0].Labels, want) {
+		t.Errorf("Labels = %v, want %v", got[0].Labels, want)
+	}
+}
+
+func TestParseDockerInspect_NoOwnershipLabelsIsNil(t *testing.T) {
+	// Um container que nunca foi redeployado desde que os labels passaram a ser
+	// emitidos não tem nenhum — e o campo tem de SAIR do JSON, não virar um
+	// objeto vazio: é o que mantém o report compatível com o intake antigo.
+	raw := []byte(`[{
+	  "Id": "abc123", "Name": "/legado",
+	  "Config": {"Image": "legado:1", "Labels": {"maintainer": "alguem"}},
+	  "State": {"Status": "running"},
+	  "NetworkSettings": {"Ports": {}}
+	}]`)
+
+	got, err := ParseDockerInspect(raw)
+	if err != nil {
+		t.Fatalf("ParseDockerInspect() error = %v", err)
+	}
+	if got[0].Labels != nil {
+		t.Errorf("Labels = %v, want nil", got[0].Labels)
+	}
+}
+
 func TestParseDockerInspect_InvalidJSON(t *testing.T) {
 	if _, err := ParseDockerInspect([]byte("not json")); err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
