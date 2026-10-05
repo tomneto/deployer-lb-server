@@ -956,11 +956,30 @@ step3_binary_lb() {
 
 step3_binary_agent() {
     log "step 3/6: installing binary to ${BIN_DIR}/deployer-lb-agent"
-    local tmp
+    local tmp target
+    target="${BIN_DIR}/deployer-lb-agent"
     tmp="$(download_or_build_binary "deployer-lb-agent" "agent" "cmd/agent")"
-    install -m 0755 "$tmp" "${BIN_DIR}/deployer-lb-agent"
+
+    # O binário novo tem de EXECUTAR aqui antes de substituir o que está
+    # funcionando. Um download truncado, um asset de outra arquitetura ou uma
+    # libc incompatível só aparecem na hora de rodar — e até esta checagem
+    # existir, a troca era um `install` por cima do arquivo em uso: o serviço
+    # reiniciava, o binário não subia, o `Restart=always` entrava em laço e o
+    # servidor sumia do backoffice. Uma atualização que falha não pode derrubar
+    # a comunicação com o host.
+    if ! "$tmp" -v >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "o binário baixado não executa neste host (arquitetura ou libc incompatível) — nada foi substituído, o agente atual segue no ar"
+    fi
+
+    # E guarda o que está rodando, para poder voltar se o novo subir e morrer.
+    if [[ -f "$target" ]]; then
+        cp -a "$target" "${target}.previous" 2>/dev/null || true
+    fi
+
+    install -m 0755 "$tmp" "$target"
     rm -f "$tmp"
-    ensure_selinux_compat "${BIN_DIR}/deployer-lb-agent"
+    ensure_selinux_compat "$target"
 }
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1142,12 @@ step5_systemd_lb() {
     systemctl restart deployer-lb-server.service
 }
 
+# Quantos segundos o agente precisa ficar de pé para a troca ser considerada
+# boa. Cinco porque o `RestartSec` da unit é 5s: abaixo disso um binário que
+# morre na largada ainda pareceria "ativo" na primeira olhada, no intervalo
+# entre o crash e o systemd reiniciá-lo.
+AGENT_SETTLE_SECONDS="${AGENT_SETTLE_SECONDS:-8}"
+
 step5_systemd_agent() {
     log "step 5/6: systemd unit (deployer-lb-agent.service)"
     install -m 0644 "$REPO_ROOT/systemd/deployer-lb-agent.service" "$SYSTEMD_DIR/deployer-lb-agent.service"
@@ -1131,6 +1156,53 @@ step5_systemd_agent() {
     # enable --now is a no-op on an already-active unit; restart so a re-run
     # of setup.sh actually swaps the running process to the new binary.
     systemctl restart deployer-lb-agent.service
+
+    restart_agent_or_rollback
+}
+
+# Confere que o agente ficou de pé depois da troca e, se não ficou, volta o
+# binário anterior.
+#
+# `is-active` logo depois do restart não prova nada: o systemd responde
+# "activating"/"active" antes de o processo decidir morrer. O que prova é ele
+# continuar ativo depois da janela de RestartSec — um binário que entra em laço
+# de restart acumula `NRestarts`.
+#
+# Sem binário anterior (primeira instalação) não há para onde voltar: aí o
+# script falha alto, que é o certo — melhor um provisionamento vermelho do que
+# um host registrado que nunca reporta.
+restart_agent_or_rollback() {
+    local unit="deployer-lb-agent.service"
+    local target="${BIN_DIR}/deployer-lb-agent"
+    local previous="${target}.previous"
+
+    sleep "$AGENT_SETTLE_SECONDS"
+
+    local restarts
+    restarts="$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)"
+    if systemctl is-active --quiet "$unit" && [[ "${restarts:-0}" -le 1 ]]; then
+        log "agent is up on the new binary ($("$target" -v 2>/dev/null || echo 'version unknown'))"
+        rm -f "$previous"
+        return 0
+    fi
+
+    log "warning: the agent did not stay up after the swap (active=$(systemctl is-active "$unit" 2>/dev/null), restarts=${restarts})"
+    journalctl -u "$unit" -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
+
+    if [[ ! -f "$previous" ]]; then
+        die "the new agent binary does not stay up and there is no previous binary to roll back to"
+    fi
+
+    log "rolling back to the previous binary"
+    install -m 0755 "$previous" "$target"
+    ensure_selinux_compat "$target"
+    rm -f "$previous"
+    systemctl restart "$unit"
+    sleep "$AGENT_SETTLE_SECONDS"
+    if systemctl is-active --quiet "$unit"; then
+        die "the new agent binary did not stay up; rolled back to the previous one, which IS running — the host keeps reporting, and the update needs looking at"
+    fi
+    die "the new agent binary did not stay up and the rollback did not come up either — the host has stopped reporting"
 }
 
 # ---------------------------------------------------------------------------
