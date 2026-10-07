@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -257,5 +258,112 @@ func TestExecute_ContextCancelKillsWithoutClaimingATimeout(t *testing.T) {
 	}
 	if res.TimedOut {
 		t.Error("a shutdown must not be reported as the command timing out")
+	}
+}
+
+// ───────────────────── keepalive while a command is quiet ─────────────────
+
+// A build is quiet for minutes at a time (a compile, a layer upload), and the
+// panel's lease is renewed only by a log call. Without this the runner would be
+// given up on exactly during the steps phase 2 exists for.
+func TestExecute_QuietCommandKeepsTheLeaseAlive(t *testing.T) {
+	e := testExecutor(t)
+	e.KeepaliveInterval = 20 * time.Millisecond
+
+	var mu sync.Mutex
+	var batches [][]string
+	sink := func(lines []string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		batches = append(batches, lines)
+		return nil
+	}
+
+	res := e.Execute(context.Background(), Command{
+		ID: "quiet", Command: "sleep 0.4", Mode: "stream", TimeoutSeconds: 10,
+	}, sink)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit=%d output=%q", res.ExitCode, res.Output)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	empty := 0
+	for _, b := range batches {
+		if len(b) == 0 {
+			empty++
+		}
+	}
+	if empty == 0 {
+		t.Fatalf("a command that printed nothing for 400ms sent no keepalive (batches=%v)", batches)
+	}
+	// It must not count as output, or the result would promise log batches the
+	// panel never got lines from.
+	if res.Seq != 0 {
+		t.Errorf("Seq = %d, want 0: a keepalive is not a batch", res.Seq)
+	}
+}
+
+// A command that is talking already renews the lease by talking; a keepalive on
+// top of that is pure noise on the panel.
+func TestExecute_ChattyCommandSendsNoKeepalive(t *testing.T) {
+	e := testExecutor(t)
+	e.KeepaliveInterval = 30 * time.Millisecond
+	e.FlushInterval = time.Millisecond
+	e.FlushLines = 1
+
+	var mu sync.Mutex
+	empty := 0
+	sink := func(lines []string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(lines) == 0 {
+			empty++
+		}
+		return nil
+	}
+
+	res := e.Execute(context.Background(), Command{
+		ID:      "chatty",
+		Command: "for i in 1 2 3 4 5 6 7 8; do echo line$i; sleep 0.02; done",
+		Mode:    "stream", TimeoutSeconds: 10,
+	}, sink)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit=%d output=%q", res.ExitCode, res.Output)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if empty != 0 {
+		t.Errorf("sent %d keepalive(s) while the command was printing every 20ms", empty)
+	}
+}
+
+// `docker login` gets two minutes and the lease is shorter than that: a
+// buffered command has to renew its lease too, even though it ships no output
+// until the end.
+func TestExecute_BufferedCommandAlsoKeepsAlive(t *testing.T) {
+	e := testExecutor(t)
+	e.KeepaliveInterval = 20 * time.Millisecond
+
+	var mu sync.Mutex
+	empty := 0
+	sink := func(lines []string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(lines) == 0 {
+			empty++
+		}
+		return nil
+	}
+
+	e.Execute(context.Background(), Command{
+		ID: "buffered", Command: "sleep 0.3", TimeoutSeconds: 10,
+	}, sink)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if empty == 0 {
+		t.Error("a buffered command sent no keepalive: its lease would expire while it was merely slow")
 	}
 }

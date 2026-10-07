@@ -35,6 +35,13 @@ const (
 	// DefaultMaxOutputBytes caps what one command may accumulate in memory
 	// before the tail is dropped. A runaway `yes` must not OOM the laptop.
 	DefaultMaxOutputBytes = 8 << 20 // 8 MiB
+
+	// DefaultKeepaliveInterval is how often a quiet command tells the panel it
+	// is still running (see Executor.KeepaliveInterval). It has to be a good
+	// deal shorter than the panel's lease window so a single dropped batch is
+	// not also an expired lease: at 30s against a 90s lease, three in a row
+	// have to be lost before a healthy command is given up on.
+	DefaultKeepaliveInterval = 30 * time.Second
 )
 
 // ExitTimedOut is the exit code reported when the runner killed the process

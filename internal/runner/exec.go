@@ -42,6 +42,25 @@ type Executor struct {
 	FlushInterval time.Duration
 	FlushLines    int
 
+	// KeepaliveInterval is how long a command may go without saying ANYTHING
+	// to the panel before the runner sends an empty log batch on its behalf.
+	//
+	// This is not cosmetic. The panel leases a claimed command and expires it
+	// after a window of silence (plan 1.3), and the only thing that renews
+	// that lease is a log call. A `test` step talks constantly, so phase 1
+	// never noticed; a build does not. `docker build` compiling a Go binary,
+	// `npm ci` resolving a lockfile and `docker push` uploading one large
+	// layer all go quiet for minutes with nothing to print — and a lease that
+	// expires there fails a run that was working, with "the machine went
+	// quiet" as the reason. The empty batch is the runner saying "still here"
+	// in the one channel the panel already listens on.
+	//
+	// It applies to buffered commands too, which is where the subtler case
+	// lives: `docker login` gets two minutes to answer and the lease is
+	// shorter than that, so a slow registry would expire a command that was
+	// merely slow.
+	KeepaliveInterval time.Duration
+
 	// MaxOutputBytes caps the retained output. Lines past the cap still flow to
 	// the log endpoint in stream mode; it is the in-memory copy that stops
 	// growing.
@@ -55,6 +74,10 @@ type Executor struct {
 // It returns an error the executor deliberately ignores: a log batch that fails
 // to reach the panel must never abort the command that produced it. The run
 // matters; the live view is a convenience.
+//
+// An EMPTY batch is a keepalive, not a batch of nothing: it carries no output
+// and must NOT consume a sequence number, or the panel would see the next real
+// batch as a gap. Loop.run is where that rule is enforced.
 type LogSink func(lines []string) error
 
 func (e *Executor) shell() (string, string) {
@@ -103,6 +126,13 @@ func (e *Executor) maxOutput() int {
 		return e.MaxOutputBytes
 	}
 	return DefaultMaxOutputBytes
+}
+
+func (e *Executor) keepaliveInterval() time.Duration {
+	if e.KeepaliveInterval > 0 {
+		return e.KeepaliveInterval
+	}
+	return DefaultKeepaliveInterval
 }
 
 // Execute runs c to completion (or to its deadline) and always returns a
@@ -169,8 +199,27 @@ func (e *Executor) Execute(ctx context.Context, c Command, sink LogSink) Result 
 		collector.consume(pipeR)
 	}()
 
+	// The keepalive ticker lives exactly as long as the process does. It is a
+	// separate goroutine and not a check inside add() on purpose: the case it
+	// exists for is the one where add() is never called.
+	aliveDone := make(chan struct{})
+	go func() {
+		every := e.keepaliveInterval()
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-aliveDone:
+				return
+			case <-ticker.C:
+				collector.keepalive(every)
+			}
+		}
+	}()
+
 	timeout := c.Timeout(e.DefaultTimeout)
 	timedOut := e.wait(ctx, cmd, timeout)
+	close(aliveDone)
 
 	// Wait for the reader to drain: once the group is dead the pipe closes and
 	// this returns promptly. Doing it before reading res.Output is what makes
@@ -270,7 +319,11 @@ type outputCollector struct {
 	truncated bool
 	pending   []string
 	lastFlush time.Time
-	batches   int
+	// lastContact is the last time ANYTHING went to the panel for this
+	// command, keepalives included. The lease is renewed by contact, not by
+	// output, so this and not lastFlush is what the keepalive measures.
+	lastContact time.Time
+	batches     int
 }
 
 func newOutputCollector(e *Executor, c Command, sink LogSink) *outputCollector {
@@ -283,12 +336,13 @@ func newOutputCollector(e *Executor, c Command, sink LogSink) *outputCollector {
 		lines = 50
 	}
 	return &outputCollector{
-		sink:       sink,
-		streaming:  c.Streaming() && sink != nil,
-		flushEvery: every,
-		flushLines: lines,
-		maxBytes:   e.maxOutput(),
-		lastFlush:  time.Now(),
+		sink:        sink,
+		streaming:   c.Streaming() && sink != nil,
+		flushEvery:  every,
+		flushLines:  lines,
+		maxBytes:    e.maxOutput(),
+		lastFlush:   time.Now(),
+		lastContact: time.Now(),
 	}
 }
 
@@ -339,11 +393,33 @@ func (o *outputCollector) flush() {
 	}
 	batch := o.pending
 	o.pending = nil
-	o.lastFlush = time.Now()
+	now := time.Now()
+	o.lastFlush = now
+	o.lastContact = now
 	o.batches++
 	o.mu.Unlock()
 
 	_ = o.sink(batch)
+}
+
+// keepalive sends an empty batch when the command has said nothing to the
+// panel for at least every. It is what keeps the panel's lease alive across a
+// quiet stretch of a build — see Executor.KeepaliveInterval.
+//
+// Unlike flush it does NOT care about o.streaming: a buffered command sends no
+// output and still needs its lease renewed. It also does not count as a batch,
+// because it carries none.
+func (o *outputCollector) keepalive(every time.Duration) {
+	o.mu.Lock()
+	quiet := o.sink != nil && len(o.pending) == 0 && time.Since(o.lastContact) >= every
+	if quiet {
+		o.lastContact = time.Now()
+	}
+	o.mu.Unlock()
+	if !quiet {
+		return
+	}
+	_ = o.sink(nil)
 }
 
 func (o *outputCollector) text() (string, bool) {

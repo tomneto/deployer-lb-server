@@ -62,6 +62,7 @@ func main() {
 		backoffMax   = flag.Duration("backoff-max", envDurationOr("RUNNER_BACKOFF_MAX", 60*time.Second), "cap on the retry pause while the panel is unreachable")
 		flushEvery   = flag.Duration("log-flush-interval", envDurationOr("RUNNER_LOG_FLUSH_INTERVAL", 500*time.Millisecond), "how often streamed output is shipped")
 		flushLines   = flag.Int("log-flush-lines", envIntOr("RUNNER_LOG_FLUSH_LINES", 50), "how many lines force an early flush of streamed output")
+		keepalive    = flag.Duration("keepalive-interval", envDurationOr("RUNNER_KEEPALIVE_INTERVAL", runner.DefaultKeepaliveInterval), "how often a quiet command tells the panel it is still running (renews the panel's lease; must stay well under it)")
 
 		showVerS = flag.Bool("v", false, "print version and exit")
 		showVerL = flag.Bool("version", false, "print version and exit")
@@ -127,6 +128,8 @@ func main() {
 			FlushInterval:  *flushEvery,
 			FlushLines:     *flushLines,
 			MaxOutputBytes: *maxOutput,
+
+			KeepaliveInterval: *keepalive,
 		},
 		Logger:    log.Default(),
 		IdleDelay: *idleDelay,

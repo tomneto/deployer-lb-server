@@ -161,7 +161,16 @@ func (l *Loop) run(ctx context.Context, cmd Command) Result {
 	seq := 0
 	sink := func(lines []string) error {
 		batch := LogBatch{CommandID: cmd.ID, Seq: seq, Lines: lines}
-		seq++
+		if len(lines) == 0 {
+			// A keepalive (Executor.KeepaliveInterval): it renews the panel's
+			// lease and carries no output, so it rides on the seq the NEXT
+			// real batch will use and does not advance the counter. Consuming
+			// a number here would make that next batch look like a gap, and
+			// the panel would stamp a hole into a log that has none.
+			batch.Lines = []string{}
+		} else {
+			seq++
+		}
 		// Deliberately detached from ctx's cancellation for the common case?
 		// No: if the runner is shutting down there is no point shipping logs.
 		// But a failure here is swallowed by the executor by design.

@@ -340,3 +340,49 @@ func TestLoop_CancelledContextStopsCleanly(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+// The panel detects a lost log batch by a jump in seq. A keepalive carries no
+// output, so burning a number on it would stamp a hole into a log that has
+// none — and the panel would report a gap on a perfectly healthy build.
+func TestLoop_KeepaliveDoesNotConsumeASequenceNumber(t *testing.T) {
+	f := &fakeClaimer{}
+	loop := &Loop{
+		Client: f,
+		Exec: &Executor{
+			Workdir:           t.TempDir(),
+			DefaultTimeout:    5 * time.Second,
+			FlushInterval:     time.Millisecond,
+			FlushLines:        1,
+			KeepaliveInterval: 20 * time.Millisecond,
+		},
+	}
+	// One batch, a quiet stretch long enough for several keepalives, another
+	// batch.
+	loop.run(context.Background(), Command{
+		ID:      "c",
+		Command: "echo one; sleep 0.25; echo two",
+		Mode:    "stream", TimeoutSeconds: 5,
+	})
+
+	_, logs, _ := f.snapshot()
+	keepalives, nextSeq := 0, 0
+	for _, b := range logs {
+		if len(b.Lines) == 0 {
+			keepalives++
+			if b.Seq != nextSeq {
+				t.Errorf("keepalive carries seq %d, want %d (the number the next real batch will use)", b.Seq, nextSeq)
+			}
+			continue
+		}
+		if b.Seq != nextSeq {
+			t.Fatalf("batch with output carries seq %d, want %d: a keepalive consumed a number (logs=%v)", b.Seq, nextSeq, logs)
+		}
+		nextSeq++
+	}
+	if keepalives == 0 {
+		t.Fatalf("no keepalive was sent during the quiet stretch (logs=%v)", logs)
+	}
+	if nextSeq < 2 {
+		t.Fatalf("expected two batches with output, got %d (logs=%v)", nextSeq, logs)
+	}
+}
