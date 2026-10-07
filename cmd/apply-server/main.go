@@ -38,6 +38,7 @@ func main() {
 		secret       = flag.String("secret", envOr("LB_SHARED_SECRET", ""), "HMAC shared secret")
 		confDir      = flag.String("conf-dir", envOr("NGINX_CONF_DIR", "/etc/nginx/conf.d"), "nginx conf.d directory this listener manages")
 		templatePath = flag.String("template", envOr("NGINX_TEMPLATE_PATH", "/etc/nginx/lb-templates/nginx-app.conf.tmpl"), "path to the nginx-app.conf.tmpl template")
+		mainConf     = flag.String("main-conf", envOr("NGINX_MAIN_CONF", "/etc/nginx/nginx.conf"), "the host's main nginx.conf — read for /v1/dump's fallback, and written by /v1/pool")
 		maxBodyBytes = flag.Int64("max-body-bytes", 64*1024, "max accepted request body size in bytes")
 		tsWindow     = flag.Duration("ts-window", 30*time.Second, "allowed clock skew for X-Payload-Ts")
 		nonceTTL     = flag.Duration("nonce-ttl", 5*time.Minute, "how long nonces are remembered for replay protection")
@@ -64,6 +65,7 @@ func main() {
 		Secret:       *secret,
 		ConfDir:      *confDir,
 		TemplatePath: *templatePath,
+		MainConf:     *mainConf,
 		MaxBodyBytes: *maxBodyBytes,
 		TSWindow:     *tsWindow,
 		NonceTTL:     *nonceTTL,

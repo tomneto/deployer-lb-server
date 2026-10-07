@@ -28,6 +28,12 @@ type Config struct {
 	ConfDir string // e.g. /etc/nginx/conf.d
 	// Main nginx.conf, only used as the entry point of the read-the-files
 	// fallback in GET /v1/dump. Empty means the usual /etc/nginx/nginx.conf.
+	// MainConf is the host's own nginx.conf. Empty falls back to the standard
+	// path — the same default ReadConfTree already applies, and keeping them
+	// in step matters: /v1/dump has been reading that file through the
+	// fallback since before this field was ever populated, so a handler that
+	// refused on an empty value would be refusing on a configuration that
+	// demonstrably works in production.
 	MainConf     string
 	TemplatePath string        // e.g. /etc/nginx/lb-templates/nginx-app.conf.tmpl
 	MaxBodyBytes int64         // ~64KB per §2.3

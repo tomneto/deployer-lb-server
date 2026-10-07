@@ -92,15 +92,23 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			"status": "invalid", "errors": []string{"pool is required"}})
 		return
 	}
-	if s.cfg.Runner == nil || s.cfg.MainConf == "" {
+	if s.cfg.Runner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
 		return
 	}
+	// MESMO default de ReadConfTree, e não um 503 em MainConf vazio: o campo
+	// nasceu sem ninguém preenchê-lo, e o /v1/dump funciona em produção há
+	// tempo justamente porque o leitor de arquivos aplica este default.
+	// Recusar aqui seria recusar numa configuração que comprovadamente roda.
+	mainConf := s.cfg.MainConf
+	if mainConf == "" {
+		mainConf = "/etc/nginx/nginx.conf"
+	}
 
-	original, err := os.ReadFile(s.cfg.MainConf)
+	original, err := os.ReadFile(mainConf)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"status": "error", "error": "cannot read " + s.cfg.MainConf + ": " + err.Error()})
+			"status": "error", "error": "cannot read " + mainConf + ": " + err.Error()})
 		return
 	}
 
@@ -119,13 +127,13 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, statErr := os.Stat(s.cfg.MainConf)
+	info, statErr := os.Stat(mainConf)
 	mode := os.FileMode(0o644)
 	if statErr == nil {
 		mode = info.Mode().Perm()
 	}
 
-	backup := backupPath(s.cfg.MainConf, now)
+	backup := backupPath(mainConf, now)
 	if err := os.WriteFile(backup, original, mode); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status": "error", "error": "cannot write backup: " + err.Error()})
@@ -133,7 +141,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	restore := func(reason string, code int) {
-		_ = os.WriteFile(s.cfg.MainConf, original, mode)
+		_ = os.WriteFile(mainConf, original, mode)
 		reloadOut, reloadErr := s.cfg.Runner.Reload()
 		payload := map[string]any{
 			"status": "error", "error": reason, "restored": true, "backup": backup,
@@ -148,7 +156,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, payload)
 	}
 
-	if err := os.WriteFile(s.cfg.MainConf, []byte(res.Config), mode); err != nil {
+	if err := os.WriteFile(mainConf, []byte(res.Config), mode); err != nil {
 		_ = os.Remove(backup)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status": "error", "error": "cannot write config: " + err.Error()})
@@ -171,7 +179,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Passo 5: reler com a mesma sonda que decidiu.
-	after, err := os.ReadFile(s.cfg.MainConf)
+	after, err := os.ReadFile(mainConf)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status": "error", "error": "applied but could not re-read: " + err.Error(),

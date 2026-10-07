@@ -223,3 +223,23 @@ func TestBackupPathStaysNextToTheOriginal(t *testing.T) {
 		t.Fatalf("esperava %s, veio %s", want, got)
 	}
 }
+
+// O campo nasceu sem ninguém preenchê-lo, e o /v1/dump funciona em produção há
+// tempo porque o leitor de arquivos aplica o default. Recusar com 503 aqui
+// seria recusar numa configuração que comprovadamente roda — foi o bug que
+// este teste existe para não deixar voltar.
+func TestPoolToggleFallsBackToTheStandardConfPath(t *testing.T) {
+	runner := nginx.NewFakeRunner()
+	srv, _ := newTestServer(t, runner)
+	srv.cfg.MainConf = "" // como em produção hoje
+
+	status, body := doPool(t, srv, "n8n_pool", true, "fallback")
+	if status == http.StatusServiceUnavailable {
+		t.Fatal("MainConf vazio não pode virar 503: o default é /etc/nginx/nginx.conf")
+	}
+	// Na máquina de teste esse arquivo não existe, então o esperado é um erro
+	// de LEITURA — o que prova que ele tentou o caminho padrão.
+	if !strings.Contains(fmt.Sprint(body["error"]), "/etc/nginx/nginx.conf") {
+		t.Fatalf("esperava o default no erro, veio %v", body)
+	}
+}
