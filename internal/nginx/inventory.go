@@ -38,6 +38,14 @@ type PoolServer struct {
 	// Raw keeps whatever followed the address (weight, max_fails, backup…),
 	// so the panel can show it without this struct having to model it.
 	Raw string `json:"raw,omitempty"`
+	// Healthy is a TCP probe result, filled in by the handler and not by the
+	// parser — a pointer so that "not measured" stays distinct from "refused
+	// the connection". Those two mean opposite things to whoever is looking
+	// at a backend that stopped serving, and a plain bool would collapse them.
+	//
+	// TCP only: it says the address accepts a connection, never that the
+	// application answers 200. The panel must word it that way.
+	Healthy *bool `json:"healthy,omitempty"`
 }
 
 // Vhost is a `server` block.

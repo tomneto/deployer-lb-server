@@ -54,6 +54,11 @@ func newTestServer(t *testing.T, runner nginx.Runner) (*Server, string) {
 		TSWindow:     30 * time.Second,
 		NonceTTL:     5 * time.Minute,
 	})
+	// Nenhum teste abre socket de verdade. Desde que /v1/dump também sonda os
+	// backends, o default real faria cada dump esperar o timeout de dial de
+	// cada upstream do fixture — um segundo por teste, sem medir nada.
+	// Quem quiser controlar a saúde sobrescreve com o seu próprio fakeDialer.
+	srv.cfg.DialTimeout = newFakeDialer().dial
 	return srv, confDir
 }
 

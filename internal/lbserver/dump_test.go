@@ -114,3 +114,47 @@ func TestDumpStillReturnsTextWhenNginxComplains(t *testing.T) {
 		t.Error("a saída do nginx foi descartada — é o que explica a falha")
 	}
 }
+
+// A saúde de um backend de pool só existia para conf que ESTE listener
+// escreveu — ou seja, para o conjunto vazio num LB cujo nginx.conf não inclui
+// o conf dir. Os pools que de fato carregam tráfego ficavam sem medida
+// nenhuma, que é justamente onde ela importa.
+func TestDumpReportsBackendHealthForHandWrittenPools(t *testing.T) {
+	runner := nginx.NewFakeRunner()
+	runner.DumpFunc = func() (string, error) { return dumpSample, nil }
+	srv, _ := newTestServer(t, runner)
+	dialer := newFakeDialer()
+	srv.cfg.DialTimeout = dialer.dial
+
+	_, body := doDump(t, srv)
+	pool := body["pools"].([]any)[0].(map[string]any)
+	server := pool["servers"].([]any)[0].(map[string]any)
+
+	if server["healthy"] != true {
+		t.Fatalf("esperava healthy=true, veio %v", server["healthy"])
+	}
+	if dialer.callsFor("10.10.0.2:10000") != 1 {
+		t.Fatalf("esperava uma sondagem, veio %d",
+			dialer.callsFor("10.10.0.2:10000"))
+	}
+}
+
+func TestDumpReportsARefusedBackendAsUnhealthy(t *testing.T) {
+	runner := nginx.NewFakeRunner()
+	runner.DumpFunc = func() (string, error) { return dumpSample, nil }
+	srv, _ := newTestServer(t, runner)
+	dialer := newFakeDialer()
+	dialer.unhealthy["10.10.0.2:10000"] = true
+	srv.cfg.DialTimeout = dialer.dial
+
+	_, body := doDump(t, srv)
+	pool := body["pools"].([]any)[0].(map[string]any)
+	server := pool["servers"].([]any)[0].(map[string]any)
+
+	// `false`, não ausente: "recusou a conexão" e "não foi medido" significam
+	// coisas opostas para quem olha um backend que parou de servir.
+	if healthy, ok := server["healthy"]; !ok || healthy != false {
+		t.Fatalf("esperava healthy=false presente, veio %v (presente=%v)",
+			healthy, ok)
+	}
+}

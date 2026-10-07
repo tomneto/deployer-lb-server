@@ -211,6 +211,7 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 
 	inv := nginx.BuildInventory(dump)
 	inv.ResolvePools()
+	s.probePools(inv.Pools)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"version": version.Version,
@@ -219,6 +220,40 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 		"vhosts":  inv.Vhosts,
 		"raw":     dump,
 	})
+}
+
+// probePools fills in each backend's Healthy using the same memoized TCP probe
+// /v1/status already uses.
+//
+// /v1/status could only ever report health for upstreams of confs THIS
+// listener wrote. On a host whose nginx.conf does not include the managed conf
+// dir that set is empty, so every backend actually carrying traffic had no
+// health at all — the one place it mattered most. The dump knows those pools,
+// so it is the right place to measure them.
+//
+// Concurrent because the dials are serial otherwise: eight pools against a
+// one-second timeout is eight seconds of a request the panel waits on
+// synchronously. The cache (~10s) absorbs repeated reads.
+func (s *Server) probePools(pools []nginx.Pool) {
+	var wg sync.WaitGroup
+	for i := range pools {
+		for j := range pools[i].Servers {
+			srv := &pools[i].Servers[j]
+			if srv.Host == "" || srv.Port == 0 {
+				// Nothing to dial — a unix socket or a name the parser could
+				// not split. Leaving Healthy nil says "not measured", which is
+				// the truth, instead of reporting it down.
+				continue
+			}
+			wg.Add(1)
+			go func(target *nginx.PoolServer) {
+				defer wg.Done()
+				healthy := s.upstreamHealthy(target.Host, target.Port)
+				target.Healthy = &healthy
+			}(srv)
+		}
+	}
+	wg.Wait()
 }
 
 // ---- GET /v1/status (bearer required, no HMAC) ----
