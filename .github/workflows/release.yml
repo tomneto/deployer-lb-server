@@ -8,6 +8,12 @@ name: Release
 #
 # Asset names must match what setup.sh's download_or_build_binary() fetches:
 # `<binary>-linux-<goarch>` (no extension), e.g. `deployer-lb-server-linux-amd64`.
+#
+# deployer-runner is the exception to "linux only": it runs on a development
+# machine outside the private network (plan 1.5), which today is an Intel Mac.
+# So it ships for darwin as well, and it is fetched by hand rather than by
+# setup.sh -- setup.sh provisions servers, and the runner's whole point is to
+# not be one.
 
 on:
   push:
@@ -34,7 +40,6 @@ jobs:
 
       - name: Build binaries
         env:
-          GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
@@ -42,10 +47,18 @@ jobs:
           ver="$(git describe --tags --always --dirty)"
           ldflags="-X github.com/tomneto/deployer-lb-server/internal/version.Version=${ver}"
 
-          go build -tags lb -ldflags "$ldflags" \
+          GOOS=linux go build -tags lb -ldflags "$ldflags" \
             -o "deployer-lb-server-linux-${GOARCH}" ./cmd/apply-server
-          go build -tags agent -ldflags "$ldflags" \
+          GOOS=linux go build -tags agent -ldflags "$ldflags" \
             -o "deployer-lb-agent-linux-${GOARCH}" ./cmd/agent
+
+          # The runner carries no build tag (internal/runner is stdlib-only, so
+          # there is no dependency graph to isolate) and ships for both OSes:
+          # the machine it runs on is a laptop, not a server.
+          for goos in linux darwin; do
+            GOOS="$goos" go build -ldflags "$ldflags" \
+              -o "deployer-runner-${goos}-${GOARCH}" ./cmd/runner
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -53,6 +66,8 @@ jobs:
           path: |
             deployer-lb-server-linux-${{ matrix.goarch }}
             deployer-lb-agent-linux-${{ matrix.goarch }}
+            deployer-runner-linux-${{ matrix.goarch }}
+            deployer-runner-darwin-${{ matrix.goarch }}
           if-no-files-found: error
 
   release:
@@ -88,7 +103,7 @@ jobs:
           git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
           cat notes.md
 
-      # Belt and braces for the failure above: assert the four assets are on
+      # Belt and braces for the failure above: assert every asset is on
       # disk before publishing, so a release can never again be cut empty and
       # be reported as a success. setup.sh's download_or_build_binary() falls
       # back to `go build` when an asset 404s, so an empty release degrades
@@ -99,7 +114,9 @@ jobs:
           set -euo pipefail
           ls -la dist/
           for f in deployer-lb-server-linux-amd64 deployer-lb-server-linux-arm64 \
-                   deployer-lb-agent-linux-amd64 deployer-lb-agent-linux-arm64; do
+                   deployer-lb-agent-linux-amd64 deployer-lb-agent-linux-arm64 \
+                   deployer-runner-linux-amd64 deployer-runner-linux-arm64 \
+                   deployer-runner-darwin-amd64 deployer-runner-darwin-arm64; do
             [[ -s "dist/$f" ]] || { echo "missing or empty asset: dist/$f" >&2; exit 1; }
           done
 
