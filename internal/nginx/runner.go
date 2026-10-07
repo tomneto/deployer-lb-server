@@ -58,25 +58,33 @@ type RealRunner struct{}
 // error-pages) that the real template `include`s — that wiring belongs to
 // B3/B4 provisioning, which is expected to ship a `Test` override or extend
 // this wrapper once the real template/snippet layout lands.
-// The pid path is overridden because `nginx -t` opens the pidfile even when
-// it is only validating, and the default is /run/nginx.pid. The unit runs
-// under ProtectSystem=strict with /etc/nginx as the only writable path, so
-// /run is read-only and the probe died on something that has nothing to do
-// with the configuration being tested:
+//
+// `nginx -t` does not only parse: it opens the pidfile and both log
+// destinations to check it could write them. Every one of those defaults
+// points outside confDir, and the unit runs under ProtectSystem=strict with
+// /etc/nginx as the only writable path — so the probe kept dying on things
+// that have nothing to do with the configuration being tested:
 //
 //	[emerg] open() "/run/nginx.pid" failed (30: Read-only file system)
-//	nginx: configuration file .nginx-test.conf test failed
+//	[emerg] open() "/var/log/nginx/access.log" failed (30: Read-only file system)
 //
 // The effect was a permanent `config_ok: false` in /v1/status on a host whose
 // config is perfectly valid — the backoffice drew "config inválida" in red
-// next to an nginx that was serving traffic. Pointing the pidfile inside
-// confDir (already writable, since the wrapper itself is written there) makes
-// the test depend on the configuration alone, and keeps working for anyone who
-// packages the unit with a different sandbox.
+// next to an nginx that was serving traffic.
+//
+// Note the access log default is NOT inherited from the live nginx.conf (this
+// wrapper never includes it): it is the path nginx was COMPILED with, which on
+// Debian/Ubuntu is /var/log/nginx/access.log. So the wrapper has to name its
+// own, the same way it names its own pid.
+//
+// Everything the probe writes now lands inside confDir, which is writable by
+// definition since the wrapper itself is written there. The test depends on the
+// configuration alone, and nobody has to widen the unit's sandbox to make it
+// pass — widening it would mean handing a validation probe write access to
+// /run and /var/log just to read a boolean.
 func (RealRunner) Test(confDir string) (bool, string, error) {
 	wrapper := filepath.Join(confDir, ".nginx-test.conf")
-	content := fmt.Sprintf("events {}\nhttp {\n    include %s/*.conf;\n}\n", confDir)
-	if err := os.WriteFile(wrapper, []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(wrapper, []byte(wrapperContent(confDir)), 0o600); err != nil {
 		return false, "", err
 	}
 	defer os.Remove(wrapper)
@@ -88,6 +96,14 @@ func (RealRunner) Test(confDir string) (bool, string, error) {
 	cmd := exec.Command("nginx", args...)
 	out, err := cmd.CombinedOutput()
 	return err == nil, string(out), err
+}
+
+// wrapperContent is the throwaway nginx.conf the probe validates against.
+// Split out so the access_log override is covered by a test rather than living
+// only inside a call the suite never reaches.
+func wrapperContent(confDir string) string {
+	return fmt.Sprintf(
+		"events {}\nhttp {\n    access_log off;\n    include %s/*.conf;\n}\n", confDir)
 }
 
 // testPidPath keeps the throwaway pidfile next to the throwaway wrapper: that
@@ -103,7 +119,9 @@ func testPidPath(confDir string) string {
 // living only inside an exec call that the suite never reaches — it was the
 // absence of that override that produced a permanent false `config_ok: false`.
 func testArgs(wrapper, pid string) []string {
-	return []string{"-t", "-c", wrapper, "-g", "pid " + pid + ";"}
+	// error_log is a main-context directive, so it rides in -g next to pid;
+	// access_log is http-context and lives in the wrapper body above.
+	return []string{"-t", "-c", wrapper, "-g", "pid " + pid + "; error_log stderr;"}
 }
 
 // Reload asks systemd to reload the nginx service (never `restart` — see

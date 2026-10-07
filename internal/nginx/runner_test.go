@@ -23,11 +23,30 @@ func TestTestArgsOverridesThePidPath(t *testing.T) {
 	args := testArgs("/etc/nginx/conf.d/.nginx-test.conf", "/etc/nginx/conf.d/.nginx-test.pid")
 
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-g pid /etc/nginx/conf.d/.nginx-test.pid;") {
+	if !strings.Contains(joined, "pid /etc/nginx/conf.d/.nginx-test.pid;") {
 		t.Fatalf("pid override ausente: %q", joined)
 	}
 	if strings.Contains(joined, "/run/nginx.pid") {
 		t.Fatalf("ainda aponta para /run: %q", joined)
+	}
+	// error_log é diretiva de contexto main, então só cabe aqui — e o default
+	// compilado aponta para /var/log/nginx, fora do sandbox.
+	if !strings.Contains(joined, "error_log stderr;") {
+		t.Fatalf("error_log nao redirecionado: %q", joined)
+	}
+}
+
+// O access_log default NÃO vem do nginx.conf vivo (o wrapper nunca o inclui):
+// é o caminho com que o nginx foi COMPILADO — /var/log/nginx/access.log no
+// Debian/Ubuntu —, e foi o que sobrou falhando depois de resolver o pidfile.
+func TestWrapperDesligaOAccessLog(t *testing.T) {
+	got := wrapperContent("/etc/nginx/conf.d")
+
+	if !strings.Contains(got, "access_log off;") {
+		t.Fatalf("wrapper nao desliga o access_log:\n%s", got)
+	}
+	if !strings.Contains(got, "include /etc/nginx/conf.d/*.conf;") {
+		t.Fatalf("wrapper nao inclui o overlay:\n%s", got)
 	}
 }
 
