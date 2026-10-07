@@ -717,7 +717,7 @@ download_or_build_binary() {
         log "prebuilt binary $prebuilt is stale (version '$prebuilt_ver', checkout is '$checkout_ver') — ignoring it"
     fi
 
-    log "fetching binary: trying GH release first, falling back to local go build"
+    log "buscando binario: GH release primeiro, build local como fallback"
     # Release assets are published per-arch (name-linux-<goarch>, matching the
     # cross-compile matrix repo_source.py already builds for): a single
     # arch-less asset name would silently serve the wrong binary on a
@@ -736,7 +736,11 @@ download_or_build_binary() {
         return 0
     fi
 
-    log "GH release unavailable (expected until a release is published — TODO D10), building locally"
+    # Chegar aqui é excecao, nao o caminho normal: desde v0.4.0 o workflow
+    # .github/workflows/release.yml publica os quatro assets a cada tag v*.
+    # Cair no build local significa rede bloqueada, tag sem release, ou arch
+    # fora da matriz — e ai e preciso Go no host, que varios alvos nao tem.
+    log "GH release inalcancavel (rede? tag sem release?) — compilando localmente"
     have go || die "no GH release reachable and no local Go toolchain (go) to build ${name} from ${cmddir}"
     [[ -d "$REPO_ROOT/$cmddir" ]] || die "cannot build: $REPO_ROOT/$cmddir does not exist yet"
     # Stamp the build version so `<binary> -v` and the report/status payloads
