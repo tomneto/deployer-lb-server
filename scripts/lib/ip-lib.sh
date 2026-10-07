@@ -159,13 +159,21 @@ ip_guard_restore() {
 ip_guard_set_elements() {
     local set_name="$1"
     ip_guard_table_present || return 0
+    # O `|| true` no fim não é cosmético. Com um set VAZIO — que é o estado
+    # inicial de todo host — o `grep -v '^$'` não casa nada e sai 1; sob o
+    # `set -euo pipefail` do ipctl.sh isso aborta o script no MEIO do JSON.
+    # `ipctl list` então imprimia um objeto truncado e saía 1, e o agente Go
+    # (que usa `cmd.Output()`, onde exit≠0 descarta a saída) reportava
+    # `ipctl_present: false` — ou seja, o guard nunca apareceu no painel em
+    # host nenhum que ainda não tivesse uma regra. `ip_guard_status_json` já
+    # se protegia assim nos contadores; só esta ficou de fora.
     _nft list set inet "$IP_GUARD_TABLE" "$set_name" 2>/dev/null \
         | tr '\n' ' ' \
         | sed -n 's/.*elements[[:space:]]*=[[:space:]]*{\([^}]*\)}.*/\1/p' \
         | tr ',' '\n' \
         | sed 's/[[:space:]]//g' \
         | grep -v '^$' \
-        | sort -u
+        | sort -u || true
 }
 
 # ─────────────────────────── address helpers ───────────────────────────
