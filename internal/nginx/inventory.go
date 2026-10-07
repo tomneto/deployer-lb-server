@@ -30,6 +30,11 @@ type Pool struct {
 	File    string       `json:"file"`
 	Managed bool         `json:"managed"`
 	Servers []PoolServer `json:"servers"`
+	// Down is true when EVERY backend carries the `down` parameter — the
+	// position of the panel's toggle. "every", not "any": a pool with one of
+	// three backends out is still serving, and showing it as disabled would
+	// be a lie.
+	Down bool `json:"down"`
 }
 
 type PoolServer struct {
@@ -38,6 +43,8 @@ type PoolServer struct {
 	// Raw keeps whatever followed the address (weight, max_fails, backup…),
 	// so the panel can show it without this struct having to model it.
 	Raw string `json:"raw,omitempty"`
+	// Down mirrors the nginx `down` parameter on this one backend.
+	Down bool `json:"down,omitempty"`
 	// Healthy is a TCP probe result, filled in by the handler and not by the
 	// parser — a pointer so that "not measured" stays distinct from "refused
 	// the connection". Those two mean opposite things to whoever is looking
@@ -190,10 +197,23 @@ func BuildInventory(dump string) Inventory {
 		if pool != nil {
 			if m := invBackendRe.FindStringSubmatch(line); m != nil {
 				port, _ := strconv.Atoi(m[2])
+				raw := strings.TrimSpace(m[3])
 				pool.Servers = append(pool.Servers, PoolServer{
-					Host: m[1], Port: port, Raw: strings.TrimSpace(m[3])})
+					Host: m[1], Port: port, Raw: raw,
+					// Por PALAVRA, não por substring: `downloads.internal`
+					// contém "down" e não está fora de rotação.
+					Down: hasDownParam(raw)})
 			}
 			if depth <= 0 {
+				// O pool está desabilitado quando TODO backend está — e um
+				// pool sem backend nenhum não está desabilitado, está vazio.
+				pool.Down = len(pool.Servers) > 0
+				for _, srv := range pool.Servers {
+					if !srv.Down {
+						pool.Down = false
+						break
+					}
+				}
 				inv.Pools = append(inv.Pools, *pool)
 				pool, depth = nil, 0
 			}

@@ -158,3 +158,32 @@ func TestDumpReportsARefusedBackendAsUnhealthy(t *testing.T) {
 			healthy, ok)
 	}
 }
+
+// Backend desligado de propósito não é sondado: pintá-lo de vermelho faria o
+// painel gritar sobre algo que a própria pessoa desligou.
+func TestDumpDoesNotProbeBackendsTakenOutOfRotation(t *testing.T) {
+	runner := nginx.NewFakeRunner()
+	runner.DumpFunc = func() (string, error) {
+		return `# configuration file /etc/nginx/nginx.conf:
+http {
+    upstream p { server 10.10.0.2:10000 down; }
+}
+`, nil
+	}
+	srv, _ := newTestServer(t, runner)
+	dialer := newFakeDialer()
+	srv.cfg.DialTimeout = dialer.dial
+
+	_, body := doDump(t, srv)
+	if dialer.callsFor("10.10.0.2:10000") != 0 {
+		t.Fatal("não podia ter sondado um backend fora de rotação")
+	}
+	pool := body["pools"].([]any)[0].(map[string]any)
+	if pool["down"] != true {
+		t.Fatalf("o pool tinha de vir marcado como desabilitado: %v", pool)
+	}
+	server := pool["servers"].([]any)[0].(map[string]any)
+	if _, measured := server["healthy"]; measured {
+		t.Fatal("não medido não pode virar um healthy qualquer")
+	}
+}

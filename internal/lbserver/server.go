@@ -140,6 +140,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/dump", s.handleDump)
 	mux.HandleFunc("/v1/apply", s.handleApply)
 	mux.HandleFunc("/v1/app/", s.handleDeleteApp)
+	mux.HandleFunc("/v1/pool", s.handlePool)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
@@ -243,6 +244,13 @@ func (s *Server) probePools(pools []nginx.Pool) {
 				// Nothing to dial — a unix socket or a name the parser could
 				// not split. Leaving Healthy nil says "not measured", which is
 				// the truth, instead of reporting it down.
+				continue
+			}
+			if srv.Down {
+				// Taken out of rotation on purpose. Probing it anyway and
+				// painting the panel red would make it shout about something
+				// the operator switched off — and `down` already says the
+				// backend gets no traffic, which is the fact that matters.
 				continue
 			}
 			wg.Add(1)

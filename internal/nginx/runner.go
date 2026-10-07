@@ -160,6 +160,25 @@ func (RealRunner) Reload() (string, error) {
 	return string(out), err
 }
 
+// TestLive validates the REAL configuration (`nginx -t`, no overlay), which is
+// a different question from Test(confDir).
+//
+// Test() validates a throwaway wrapper that includes only the managed conf dir,
+// with every scratch path redirected inside it — that is why it works under the
+// unit's sandbox. This one cannot do any of that: the file being validated is
+// the host's own nginx.conf, which declares `pid /run/nginx.pid`, and `-g "pid
+// ..."` on top of it fails with "directive is duplicate".
+//
+// So on a sandboxed host this probe simply cannot run, and the caller must be
+// able to tell "could not run" from "config is invalid" — treating the first as
+// the second would refuse every change on exactly the host that needs it. The
+// raw output is returned for that decision.
+func (RealRunner) TestLive() (bool, string, error) {
+	cmd := exec.Command("nginx", "-t")
+	out, err := cmd.CombinedOutput()
+	return err == nil, string(out), err
+}
+
 // DumpConfig runs `nginx -T` against the live, active configuration.
 func (RealRunner) DumpConfig() (string, error) {
 	cmd := exec.Command("nginx", "-T")
