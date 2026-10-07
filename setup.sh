@@ -446,7 +446,7 @@ install_swapctl() {
         log "warning: scripts/swapctl.sh or scripts/lib/swap-lib.sh not found under $REPO_ROOT — skipping swapctl install"
         return 0
     fi
-    mkdir -p "$SWAPCTL_LIB_DIR"
+    install -d -m 0755 "$SWAPCTL_LIB_DIR"
     install -m 0755 "$REPO_ROOT/scripts/lib/swap-lib.sh" "$SWAPCTL_LIB_DIR/swap-lib.sh"
     install -m 0755 "$REPO_ROOT/scripts/swapctl.sh" "$BIN_DIR/swapctl"
     log "installed swapctl at $BIN_DIR/swapctl (lib: $SWAPCTL_LIB_DIR/swap-lib.sh)"
@@ -503,7 +503,7 @@ install_ipctl() {
         return 0
     fi
     ensure_nft_installed
-    mkdir -p "$SWAPCTL_LIB_DIR"
+    install -d -m 0755 "$SWAPCTL_LIB_DIR"
     install -m 0755 "$REPO_ROOT/scripts/lib/ip-lib.sh" "$SWAPCTL_LIB_DIR/ip-lib.sh"
     install -m 0755 "$REPO_ROOT/scripts/ipctl.sh" "$BIN_DIR/ipctl"
     log "installed ipctl at $BIN_DIR/ipctl (lib: $SWAPCTL_LIB_DIR/ip-lib.sh)"
@@ -807,8 +807,15 @@ ensure_wg_keypair() {
         log "WireGuard keypair already present, reusing (private key never leaves this host)"
     else
         log "generating new WireGuard keypair"
-        umask 077
-        wg genkey | tee "$dir/privatekey" | wg pubkey > "$dir/publickey"
+        # Subshell: `umask` muda o shell inteiro e NÃO volta sozinho. Sem o
+        # parêntese, os 077 daqui vazavam para todo `mkdir` seguinte do script
+        # — e `install_swapctl`/`install_ipctl` rodam depois desta função. O
+        # diretório das libs nascia 0700, os arquivos dentro saíam 0755 pelo
+        # `install -m`, e `swapctl`/`ipctl` executados por um usuário não-root
+        # morriam em "Permission denied" ao carregar a própria lib. Só
+        # acontecia em host cujo keypair foi GERADO aqui, que é o que torna
+        # isso intermitente entre máquinas.
+        ( umask 077; wg genkey | tee "$dir/privatekey" | wg pubkey > "$dir/publickey" )
     fi
     WG_PUBKEY="$(cat "$dir/publickey")"
     log "WireGuard public key: $WG_PUBKEY (send this back to the central for peering)"
@@ -1003,7 +1010,9 @@ step3_binary_agent() {
 # silently leaving the LB unable to boot.
 write_lb_env() {
     mkdir -p /etc/deployer-lb-server
-    umask 077
+    # Em subshell: o `umask` restrito vale para este arquivo e não contamina o
+    # resto do script (ver o comentário em ensure_wg_keypair).
+    ( umask 077
     cat > /etc/deployer-lb-server/lb.env <<EOF
 LB_LISTEN_ADDR=${LB_PORT}
 NGINX_CONF_DIR=${NGINX_CONF_DIR}
@@ -1011,6 +1020,7 @@ NGINX_TEMPLATE_PATH=${NGINX_TEMPLATE_DIR}/nginx-app.conf.tmpl
 LB_TOKEN=${LB_TOKEN}
 LB_SHARED_SECRET=${LB_SECRET}
 EOF
+    )
     chmod 600 /etc/deployer-lb-server/lb.env
     log "wrote /etc/deployer-lb-server/lb.env"
     if [[ -z "$LB_TOKEN" || -z "$LB_SECRET" ]]; then
@@ -1088,6 +1098,11 @@ step4_config_agent() {
 # identically to one on an app server.
 write_agent_env() {
     mkdir -p /etc/deployer-lb-agent
+    # Restaurado no fim da função: ao contrário dos outros dois, aqui há
+    # lógica entre o umask e a escrita, e um subshell perderia a variável
+    # local. Ver o comentário em ensure_wg_keypair para o estrago que o
+    # vazamento causa.
+    local _prev_umask; _prev_umask="$(umask)"
     umask 077
     local AGENT_UNITS_LIST="${AGENT_UNITS:-}"
     if (( WITH_CROWDSEC )); then
@@ -1124,6 +1139,7 @@ AGENT_SECURITY_INTERVAL=${AGENT_SECURITY_INTERVAL}
 AGENT_UNITS=${AGENT_UNITS_LIST}
 EOF
     chmod 600 /etc/deployer-lb-agent/.env
+    umask "$_prev_umask"
     log "wrote /etc/deployer-lb-agent/.env (mode 600, not in any repo)"
 }
 
