@@ -143,3 +143,96 @@ func TestNginxAppTemplate_CacheVariant(t *testing.T) {
 		}
 	}
 }
+
+// O limite de requisições é OPT-IN, e o teste fixa isso: este template serve
+// tráfego de produto em produção, e um limite dimensionado errado não degrada
+// — devolve 429 para gente real, que é pior que a rajada que ele ia absorver.
+func TestNginxAppTemplate_RateLimitIsOptIn(t *testing.T) {
+	p := Payload{
+		SchemaVersion:  SupportedSchemaVersion,
+		Revision:       1,
+		IdempotencyKey: "app:run-1",
+		PipelineRef:    "app-a",
+		Repo:           "owner/app-a",
+		Domains:        []string{"a.workspacefy.com"},
+		Exposure:       "external",
+		Upstreams:      []Upstream{{IP: "10.10.0.2", Port: 8080}},
+		Timeouts:       Timeouts{Read: 60, Send: 60, Connect: 10},
+	}
+
+	out, err := Render(templateRelPath, p)
+	if err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+	for _, unwanted := range []string{"limit_req", "limit_req_zone"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("vhost sem rate limit não deveria conter %q\n%s", unwanted, out)
+		}
+	}
+}
+
+func TestNginxAppTemplate_RateLimitVariant(t *testing.T) {
+	p := Payload{
+		SchemaVersion:  SupportedSchemaVersion,
+		Revision:       1,
+		IdempotencyKey: "app:run-2",
+		PipelineRef:    "app-a",
+		Repo:           "owner/app-a",
+		Domains:        []string{"a.workspacefy.com"},
+		Exposure:       "external",
+		Upstreams:      []Upstream{{IP: "10.10.0.2", Port: 8080}},
+		Timeouts:       Timeouts{Read: 60, Send: 60, Connect: 10},
+		RateLimit:      RateLimitConfig{Enabled: true, Rate: 10, Burst: 25},
+	}
+
+	out, err := Render(templateRelPath, p)
+	if err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+
+	for _, want := range []string{
+		// A zona vai no contexto http (fora do server), não dentro dele.
+		"limit_req_zone $binary_remote_addr zone=app_a_pool_rl:10m rate=10r/s;",
+		"limit_req zone=app_a_pool_rl burst=25 nodelay;",
+		// 429 diz "tente de novo"; o 503 padrão do nginx não.
+		"limit_req_status 429;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rate limit variant missing %q\n%s", want, out)
+		}
+	}
+
+	// A zona precisa vir ANTES do bloco server — nginx recusa limit_req_zone
+	// dentro de server{}.
+	if strings.Index(out, "limit_req_zone") > strings.Index(out, "server {") {
+		t.Errorf("limit_req_zone tem de ficar fora do bloco server\n%s", out)
+	}
+}
+
+// Zero vira o default, nunca `rate=0r/s` — que o nginx aceita e que recusa
+// toda requisição.
+func TestNginxAppTemplate_RateLimitZeroFallsBackToDefault(t *testing.T) {
+	p := Payload{
+		SchemaVersion:  SupportedSchemaVersion,
+		Revision:       1,
+		IdempotencyKey: "app:run-3",
+		PipelineRef:    "app-a",
+		Repo:           "owner/app-a",
+		Domains:        []string{"a.workspacefy.com"},
+		Exposure:       "external",
+		Upstreams:      []Upstream{{IP: "10.10.0.2", Port: 8080}},
+		Timeouts:       Timeouts{Read: 60, Send: 60, Connect: 10},
+		RateLimit:      RateLimitConfig{Enabled: true},
+	}
+
+	out, err := Render(templateRelPath, p)
+	if err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+	if strings.Contains(out, "rate=0r/s") {
+		t.Fatalf("rate=0r/s recusaria tudo\n%s", out)
+	}
+	if !strings.Contains(out, "rate=30r/s") || !strings.Contains(out, "burst=60") {
+		t.Errorf("default não aplicado\n%s", out)
+	}
+}

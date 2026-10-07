@@ -24,6 +24,14 @@
 {{- if .Cache.Enabled}}
 proxy_cache_path /var/cache/nginx/{{ upstreamName .PipelineRef }} levels=1:2 keys_zone={{ upstreamName .PipelineRef }}_cache:10m max_size=1g inactive=60m use_temp_path=off;
 {{- end}}
+{{- if .RateLimit.Enabled}}
+{{- $rl := .RateLimit.Resolved}}
+# Zona por pipeline, em contexto http (este arquivo é incluído de dentro dele).
+# A chave é $binary_remote_addr DEPOIS do cloudflare-real-ip.conf, então conta
+# o cliente de verdade — com o endereço da edge, o limite ou nunca dispara ou
+# bloqueia todo mundo de uma vez.
+limit_req_zone $binary_remote_addr zone={{ upstreamName .PipelineRef }}_rl:10m rate={{ $rl.Rate }}r/s;
+{{- end}}
 upstream {{ upstreamName .PipelineRef }} {
 {{- range .Upstreams}}
     server {{.IP}}:{{.Port}};
@@ -64,6 +72,17 @@ server {
         proxy_send_timeout {{.Timeouts.Send}}s;
         proxy_next_upstream error timeout http_502 http_503 http_504;
         proxy_next_upstream_tries 2;
+{{- if .RateLimit.Enabled}}
+{{- $rl := .RateLimit.Resolved}}
+
+        # `nodelay` serve o burst na hora em vez de enfileirar: sem ele uma
+        # página com dezenas de assets carrega em câmera lenta mesmo dentro do
+        # limite, e o remédio fica pior que a doença. 429 em vez do 503 padrão
+        # porque é o código que diz "tente de novo", e é o que um cliente HTTP
+        # sabe tratar.
+        limit_req zone={{ upstreamName .PipelineRef }}_rl burst={{ $rl.Burst }} nodelay;
+        limit_req_status 429;
+{{- end}}
 {{- if .Cache.Enabled}}
 
         proxy_cache {{ upstreamName .PipelineRef }}_cache;

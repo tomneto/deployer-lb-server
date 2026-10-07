@@ -36,20 +36,60 @@ type CacheConfig struct {
 	Enabled bool `json:"enabled"`
 }
 
+// RateLimitConfig caps how fast one client address can hit this vhost.
+//
+// Opt-in, and deliberately so. This template serves live product traffic, and
+// a limit sized wrong does not degrade — it returns 429 to real users, which
+// is worse than the burst it was meant to absorb. Turning it on is a decision
+// per pipeline, made by someone who knows that app's request shape.
+//
+// The address counted is the one `snippets/cloudflare-real-ip.conf` restores
+// (CF-Connecting-IP), not the edge's — without that every request would look
+// like it came from a handful of Cloudflare addresses and the limit would
+// either never trigger or block everyone at once.
+type RateLimitConfig struct {
+	Enabled bool `json:"enabled"`
+	// Sustained requests per second per address. 0 falls back to the default.
+	Rate int `json:"rate"`
+	// How many requests may arrive above the rate before any are refused. A
+	// single page load pulls dozens of assets at once, so a burst well above
+	// the rate is what separates "a browser opening a page" from "a flood".
+	Burst int `json:"burst"`
+}
+
+// Defaults chosen to be invisible to a human browsing and still cut a flood.
+const (
+	DefaultRateLimitRate  = 30
+	DefaultRateLimitBurst = 60
+)
+
+// Resolved returns the config with defaults applied, so the template never
+// renders `rate=0r/s` — which nginx accepts and which refuses everything.
+func (r RateLimitConfig) Resolved() RateLimitConfig {
+	if r.Rate <= 0 {
+		r.Rate = DefaultRateLimitRate
+	}
+	if r.Burst <= 0 {
+		r.Burst = DefaultRateLimitBurst
+	}
+	return r
+}
+
 // Payload is the exact JSON body of POST /v1/apply, per pipe-improves.md §2.2.
 type Payload struct {
-	SchemaVersion  int         `json:"schema_version"`
-	Revision       int64       `json:"revision"`
-	IdempotencyKey string      `json:"idempotency_key"`
-	PipelineRef    string      `json:"pipeline_ref"`
-	Repo           string      `json:"repo"`
-	Domains        []string    `json:"domains"`
-	Exposure       string      `json:"exposure"`
-	Upstreams      []Upstream  `json:"upstreams"`
-	Websocket      bool        `json:"websocket"`
-	Cache          CacheConfig `json:"cache"`
-	Timeouts       Timeouts    `json:"timeouts"`
-	CorpOrigin     bool        `json:"corp_origin"`
+	SchemaVersion  int             `json:"schema_version"`
+	Revision       int64           `json:"revision"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	PipelineRef    string          `json:"pipeline_ref"`
+	Repo           string          `json:"repo"`
+	Domains        []string        `json:"domains"`
+	Exposure       string          `json:"exposure"`
+	Upstreams      []Upstream      `json:"upstreams"`
+	Websocket      bool            `json:"websocket"`
+	Cache          CacheConfig     `json:"cache"`
+	RateLimit      RateLimitConfig `json:"rate_limit"`
+	Timeouts       Timeouts        `json:"timeouts"`
+	CorpOrigin     bool            `json:"corp_origin"`
 }
 
 // Regexes are intentionally strict: the pipeline_ref is the *only* input
