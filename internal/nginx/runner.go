@@ -58,6 +58,21 @@ type RealRunner struct{}
 // error-pages) that the real template `include`s — that wiring belongs to
 // B3/B4 provisioning, which is expected to ship a `Test` override or extend
 // this wrapper once the real template/snippet layout lands.
+// The pid path is overridden because `nginx -t` opens the pidfile even when
+// it is only validating, and the default is /run/nginx.pid. The unit runs
+// under ProtectSystem=strict with /etc/nginx as the only writable path, so
+// /run is read-only and the probe died on something that has nothing to do
+// with the configuration being tested:
+//
+//	[emerg] open() "/run/nginx.pid" failed (30: Read-only file system)
+//	nginx: configuration file .nginx-test.conf test failed
+//
+// The effect was a permanent `config_ok: false` in /v1/status on a host whose
+// config is perfectly valid — the backoffice drew "config inválida" in red
+// next to an nginx that was serving traffic. Pointing the pidfile inside
+// confDir (already writable, since the wrapper itself is written there) makes
+// the test depend on the configuration alone, and keeps working for anyone who
+// packages the unit with a different sandbox.
 func (RealRunner) Test(confDir string) (bool, string, error) {
 	wrapper := filepath.Join(confDir, ".nginx-test.conf")
 	content := fmt.Sprintf("events {}\nhttp {\n    include %s/*.conf;\n}\n", confDir)
@@ -66,9 +81,29 @@ func (RealRunner) Test(confDir string) (bool, string, error) {
 	}
 	defer os.Remove(wrapper)
 
-	cmd := exec.Command("nginx", "-t", "-c", wrapper)
+	pid := testPidPath(confDir)
+	defer os.Remove(pid)
+
+	args := testArgs(wrapper, pid)
+	cmd := exec.Command("nginx", args...)
 	out, err := cmd.CombinedOutput()
 	return err == nil, string(out), err
+}
+
+// testPidPath keeps the throwaway pidfile next to the throwaway wrapper: that
+// directory is writable by definition (the wrapper is written there), which is
+// exactly the property /run does not have under the unit's sandbox. The name
+// deliberately does not end in .conf, so the wrapper's own `include *.conf`
+// cannot pick it up.
+func testPidPath(confDir string) string {
+	return filepath.Join(confDir, ".nginx-test.pid")
+}
+
+// testArgs is split out so the pid override is covered by a test instead of
+// living only inside an exec call that the suite never reaches — it was the
+// absence of that override that produced a permanent false `config_ok: false`.
+func testArgs(wrapper, pid string) []string {
+	return []string{"-t", "-c", wrapper, "-g", "pid " + pid + ";"}
 }
 
 // Reload asks systemd to reload the nginx service (never `restart` — see
