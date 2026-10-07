@@ -170,3 +170,36 @@ func TestInventoryNeverPanicsOnJunk(t *testing.T) {
 		_ = inv
 	}
 }
+
+// Bloco numa linha só é nginx válido, e quebrava o parser de duas formas: o
+// conteúdo inline sumia, e o `depth` nunca voltava a zero — o que levava junto
+// todos os blocos seguintes do mesmo arquivo.
+func TestInventoryHandlesSingleLineBlocks(t *testing.T) {
+	inv := BuildInventory(`# configuration file /etc/nginx/nginx.conf:
+http {
+    upstream oneline_pool { server 10.0.0.9:8080; }
+    server {
+        listen 80;
+        server_name inline.example.com;
+        location / { proxy_pass http://oneline_pool; }
+    }
+    server {
+        listen 80;
+        server_name depois.example.com;
+    }
+}
+`)
+	inv.ResolvePools()
+
+	if len(inv.Pools) != 1 || len(inv.Pools[0].Servers) != 1 {
+		t.Fatalf("pool inline mal lido: %+v", inv.Pools)
+	}
+	// O segundo vhost é a prova de que o depth voltou a zero.
+	if len(inv.Vhosts) != 2 {
+		t.Fatalf("esperava 2 vhosts, veio %d: %+v", len(inv.Vhosts), inv.Vhosts)
+	}
+	loc := inv.Vhosts[0].Locations
+	if len(loc) != 1 || loc[0].Pool != "oneline_pool" {
+		t.Errorf("location inline perdeu o destino: %+v", loc)
+	}
+}

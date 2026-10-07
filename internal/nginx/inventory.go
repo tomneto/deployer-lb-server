@@ -83,6 +83,33 @@ var (
 	invSchemeRe   = regexp.MustCompile(`^https?://([^/;]+)`)
 )
 
+// applyLocationLine extrai de uma linha o que interessa dentro de um
+// `location`. Separado para que a linha de abertura de um bloco inline passe
+// exatamente pela mesma leitura das linhas seguintes de um bloco normal.
+func applyLocationLine(loc *Location, line string) {
+	switch {
+	case invProxyRe.MatchString(line):
+		m := invProxyRe.FindStringSubmatch(line)
+		loc.ProxyPass = strings.TrimSpace(m[1])
+		if h := invSchemeRe.FindStringSubmatch(loc.ProxyPass); h != nil {
+			loc.Pool = h[1]
+		}
+	case invUpgradeRe.MatchString(line):
+		loc.Websocket = true
+	case invRootRe.MatchString(line):
+		loc.Root = strings.TrimSpace(invRootRe.FindStringSubmatch(line)[1])
+	}
+}
+
+// afterBrace devolve o que sobra da linha depois do primeiro `{`, para que o
+// conteúdo de um bloco escrito numa linha só não se perca.
+func afterBrace(line string) string {
+	if i := strings.Index(line, "{"); i >= 0 {
+		return strings.TrimSpace(line[i+1:])
+	}
+	return ""
+}
+
 // BuildInventory parses `nginx -T` output. It never fails: a dump it cannot
 // make sense of yields an empty inventory, and the caller still has the raw
 // text to show.
@@ -121,19 +148,29 @@ func BuildInventory(dump string) Inventory {
 			continue
 		}
 
+		// Um bloco pode caber numa linha só — `upstream p { server x:1; }` é
+		// nginx válido. Por isso a linha de abertura não é descartada: o que
+		// vem depois do `{` é reprocessado como se fosse a linha seguinte, e
+		// a contagem de chaves sai da linha inteira. Sem isso o conteúdo
+		// inline sumia e o `depth` nunca voltava a zero, levando junto todos
+		// os blocos seguintes do arquivo.
 		switch {
 		case pool == nil && vhost == nil && invUpstreamRe.MatchString(line):
 			m := invUpstreamRe.FindStringSubmatch(line)
 			pool = &Pool{Name: m[1], File: file, Managed: managed,
 				Servers: []PoolServer{}}
 			depth = 1
-			continue
+			if line = afterBrace(line); line == "" {
+				continue
+			}
 		case pool == nil && vhost == nil && invServerRe.MatchString(line):
 			vhost = &Vhost{File: file, Managed: managed, App: app,
 				ServerNames: []string{}, Listen: []string{},
 				Locations: []Location{}}
 			depth = 1
-			continue
+			if line = afterBrace(line); line == "" {
+				continue
+			}
 		}
 
 		if pool == nil && vhost == nil {
@@ -157,18 +194,7 @@ func BuildInventory(dump string) Inventory {
 
 		// Inside a server block.
 		if loc != nil {
-			switch {
-			case invProxyRe.MatchString(line):
-				m := invProxyRe.FindStringSubmatch(line)
-				loc.ProxyPass = strings.TrimSpace(m[1])
-				if h := invSchemeRe.FindStringSubmatch(loc.ProxyPass); h != nil {
-					loc.Pool = h[1]
-				}
-			case invUpgradeRe.MatchString(line):
-				loc.Websocket = true
-			case invRootRe.MatchString(line):
-				loc.Root = strings.TrimSpace(invRootRe.FindStringSubmatch(line)[1])
-			}
+			applyLocationLine(loc, line)
 			if depth <= locDepth {
 				vhost.Locations = append(vhost.Locations, *loc)
 				loc = nil
@@ -187,6 +213,15 @@ func BuildInventory(dump string) Inventory {
 			m := invLocationRe.FindStringSubmatch(line)
 			loc = &Location{Matcher: m[1], Path: m[2]}
 			locDepth = depth - 1
+			// Mesmo caso dos blocos acima: `location / { proxy_pass X; }`
+			// numa linha só é válido, e descartar o resto perderia o destino.
+			if rest := afterBrace(line); rest != "" {
+				applyLocationLine(loc, rest)
+				if strings.Contains(rest, "}") {
+					vhost.Locations = append(vhost.Locations, *loc)
+					loc = nil
+				}
+			}
 		}
 
 		if depth <= 0 {

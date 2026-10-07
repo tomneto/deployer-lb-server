@@ -23,9 +23,12 @@ import (
 
 // Config wires the server's dependencies and policy knobs.
 type Config struct {
-	Token        string        // shared bearer token
-	Secret       string        // HMAC shared secret
-	ConfDir      string        // e.g. /etc/nginx/conf.d
+	Token   string // shared bearer token
+	Secret  string // HMAC shared secret
+	ConfDir string // e.g. /etc/nginx/conf.d
+	// Main nginx.conf, only used as the entry point of the read-the-files
+	// fallback in GET /v1/dump. Empty means the usual /etc/nginx/nginx.conf.
+	MainConf     string
 	TemplatePath string        // e.g. /etc/nginx/lb-templates/nginx-app.conf.tmpl
 	MaxBodyBytes int64         // ~64KB per §2.3
 	TSWindow     time.Duration // +/-30s per §2.3
@@ -183,16 +186,27 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	source := "nginx -T"
 	dump, err := s.cfg.Runner.DumpConfig()
 	if err != nil {
-		// The text still goes out: `nginx -T` fails with a non-zero exit on a
-		// config it refuses, and its complaint on stderr is exactly what
-		// someone staring at a broken load balancer needs to read.
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "error", "error": err.Error(), "raw": dump,
-			"pools": []any{}, "vhosts": []any{},
-		})
-		return
+		// `nginx -T` cannot run under this unit's sandbox, and the directive
+		// that breaks it is not ours to override: the main config declares
+		// `pid /run/nginx.pid`, ProtectSystem=strict makes /run read-only, and
+		// `-g "pid ..."` fails with "directive is duplicate". Reading is never
+		// blocked by the sandbox, so fall back to walking the config tree.
+		//
+		// Lower fidelity (no variable expansion, no nginx prefix logic), and
+		// the response says which source it used so the panel never presents a
+		// guess as a measurement.
+		tree, readErr := nginx.ReadConfTree(s.cfg.MainConf)
+		if readErr != nil || strings.TrimSpace(tree) == "" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": "error", "error": err.Error(), "raw": dump,
+				"source": source, "pools": []any{}, "vhosts": []any{},
+			})
+			return
+		}
+		dump, source = tree, "arquivos de config"
 	}
 
 	inv := nginx.BuildInventory(dump)
@@ -200,6 +214,7 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"version": version.Version,
+		"source":  source,
 		"pools":   inv.Pools,
 		"vhosts":  inv.Vhosts,
 		"raw":     dump,
