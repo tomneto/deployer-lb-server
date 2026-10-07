@@ -50,6 +50,43 @@ func TestWrapperDesligaOAccessLog(t *testing.T) {
 	}
 }
 
+// Enumerados juntos de proposito: corrigir um caminho por vez so empurra o
+// erro para o proximo, e foi o que aconteceu tres vezes — pid, depois
+// access_log, depois /var/lib/nginx/body. Esta lista foi verificada contra o
+// host real dentro do sandbox da unit.
+func TestWrapperRedirecionaTodosOsCaminhosDeEscrita(t *testing.T) {
+	got := wrapperContent("/etc/nginx/conf.d")
+	tmp := testTempDir("/etc/nginx/conf.d")
+
+	for _, d := range []string{
+		"client_body_temp_path", "proxy_temp_path",
+		"fastcgi_temp_path", "uwsgi_temp_path", "scgi_temp_path",
+	} {
+		if !strings.Contains(got, d+" "+tmp+"/") {
+			t.Fatalf("%s nao aponta para dentro de %s:\n%s", d, tmp, got)
+		}
+	}
+	for _, fora := range []string{"/var/lib/nginx", "/var/log/nginx", "/run/"} {
+		if strings.Contains(got, fora) {
+			t.Fatalf("wrapper ainda referencia %s:\n%s", fora, got)
+		}
+	}
+}
+
+// O diretorio de scratch tem de nascer e morrer com o teste: deixa-lo para
+// tras polui o conf-dir, e o `include *.conf` do proprio wrapper varre esse
+// diretorio.
+func TestTempDirFicaDentroDoConfDirENaoEConf(t *testing.T) {
+	tmp := testTempDir("/etc/nginx/conf.d")
+
+	if filepath.Dir(tmp) != "/etc/nginx/conf.d" {
+		t.Fatalf("scratch fora do confDir: %s", tmp)
+	}
+	if strings.HasSuffix(tmp, ".conf") {
+		t.Fatalf("scratch casaria com include *.conf: %s", tmp)
+	}
+}
+
 // The pidfile lives beside the wrapper because that directory is writable by
 // definition — and must not be swept up by the wrapper's own `include *.conf`.
 func TestTestPidPathIsBesideTheWrapperAndNotAConf(t *testing.T) {

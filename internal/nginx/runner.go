@@ -59,14 +59,20 @@ type RealRunner struct{}
 // B3/B4 provisioning, which is expected to ship a `Test` override or extend
 // this wrapper once the real template/snippet layout lands.
 //
-// `nginx -t` does not only parse: it opens the pidfile and both log
-// destinations to check it could write them. Every one of those defaults
-// points outside confDir, and the unit runs under ProtectSystem=strict with
-// /etc/nginx as the only writable path — so the probe kept dying on things
-// that have nothing to do with the configuration being tested:
+// `nginx -t` does not only parse. It opens the pidfile, both log destinations
+// AND the five scratch directories it would use at runtime, checking it could
+// write each one. Every default points outside confDir, and the unit runs
+// under ProtectSystem=strict with /etc/nginx as the only writable path — so
+// the probe kept dying on things that have nothing to do with the
+// configuration being tested, one at a time:
 //
 //	[emerg] open() "/run/nginx.pid" failed (30: Read-only file system)
 //	[emerg] open() "/var/log/nginx/access.log" failed (30: Read-only file system)
+//	[emerg] chown("/var/lib/nginx/body", 65534) failed (30: Read-only file system)
+//
+// They are listed together because fixing them one at a time just moves the
+// error to the next path — this was found three times before the whole set
+// was enumerated and verified against the real host.
 //
 // The effect was a permanent `config_ok: false` in /v1/status on a host whose
 // config is perfectly valid — the backoffice drew "config inválida" in red
@@ -89,6 +95,12 @@ func (RealRunner) Test(confDir string) (bool, string, error) {
 	}
 	defer os.Remove(wrapper)
 
+	tmp := testTempDir(confDir)
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		return false, "", err
+	}
+	defer os.RemoveAll(tmp)
+
 	pid := testPidPath(confDir)
 	defer os.Remove(pid)
 
@@ -102,8 +114,24 @@ func (RealRunner) Test(confDir string) (bool, string, error) {
 // Split out so the access_log override is covered by a test rather than living
 // only inside a call the suite never reaches.
 func wrapperContent(confDir string) string {
-	return fmt.Sprintf(
-		"events {}\nhttp {\n    access_log off;\n    include %s/*.conf;\n}\n", confDir)
+	tmp := testTempDir(confDir)
+	return fmt.Sprintf(`events {}
+http {
+    access_log off;
+    client_body_temp_path %[1]s/body;
+    proxy_temp_path %[1]s/proxy;
+    fastcgi_temp_path %[1]s/fastcgi;
+    uwsgi_temp_path %[1]s/uwsgi;
+    scgi_temp_path %[1]s/scgi;
+    include %[2]s/*.conf;
+}
+`, tmp, confDir)
+}
+
+// testTempDir is where the probe points every scratch path nginx insists on
+// being able to write. Inside confDir, which is writable by definition.
+func testTempDir(confDir string) string {
+	return filepath.Join(confDir, ".nginx-test-tmp")
 }
 
 // testPidPath keeps the throwaway pidfile next to the throwaway wrapper: that
