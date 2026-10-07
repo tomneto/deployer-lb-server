@@ -130,10 +130,11 @@ func New(cfg Config) *Server {
 	}
 }
 
-// Routes registers the four listener endpoints on mux.
+// Routes registers the listener endpoints on mux.
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/health", s.handleHealth)
 	mux.HandleFunc("/v1/status", s.handleStatus)
+	mux.HandleFunc("/v1/dump", s.handleDump)
 	mux.HandleFunc("/v1/apply", s.handleApply)
 	mux.HandleFunc("/v1/app/", s.handleDeleteApp)
 }
@@ -152,6 +153,57 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
+}
+
+// ---- GET /v1/dump (bearer required, no HMAC) ----
+//
+// The whole running config, parsed into pools and vhosts, plus the raw text.
+//
+// /v1/status answers "what did I apply", which is a different question from
+// "what is this nginx serving". On a host whose nginx.conf does not include
+// the managed conf dir those two answers have nothing to do with each other:
+// status reports an empty load balancer while the vhosts carrying production
+// traffic live in a file this listener never wrote. A panel that could only
+// see its own files would confirm the wrong story.
+//
+// Same auth as /v1/status, and for the same reason — it leaks topology
+// (upstream addresses, domains) but not secrets, and the plan's auth row puts
+// HMAC on writes only.
+func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "invalid"})
+		return
+	}
+	if !auth.VerifyBearer(r.Header.Get("Authorization"), s.cfg.Token) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": "unauthorized"})
+		return
+	}
+	if s.cfg.Runner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
+		return
+	}
+
+	dump, err := s.cfg.Runner.DumpConfig()
+	if err != nil {
+		// The text still goes out: `nginx -T` fails with a non-zero exit on a
+		// config it refuses, and its complaint on stderr is exactly what
+		// someone staring at a broken load balancer needs to read.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "error", "error": err.Error(), "raw": dump,
+			"pools": []any{}, "vhosts": []any{},
+		})
+		return
+	}
+
+	inv := nginx.BuildInventory(dump)
+	inv.ResolvePools()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"version": version.Version,
+		"pools":   inv.Pools,
+		"vhosts":  inv.Vhosts,
+		"raw":     dump,
+	})
 }
 
 // ---- GET /v1/status (bearer required, no HMAC) ----
