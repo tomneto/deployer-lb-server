@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -365,5 +366,60 @@ func TestExecute_BufferedCommandAlsoKeepsAlive(t *testing.T) {
 	defer mu.Unlock()
 	if empty == 0 {
 		t.Error("a buffered command sent no keepalive: its lease would expire while it was merely slow")
+	}
+}
+
+// O campo `stdin` existe para que um segredo não precise viajar dentro da
+// string do comando. Antes dele o painel embutia um here-document no
+// `Command`, e essa string vira o argv de `/bin/sh -c` nesta máquina —
+// legível por `ps -ww` para qualquer usuário. `docker login --password-stdin`
+// era o caso: a senha ficava fora do argv do docker e caía no do shell.
+func TestExecute_StdinIsFedToTheCommand(t *testing.T) {
+	e := testExecutor(t)
+	res := e.Execute(context.Background(), Command{
+		ID:      "c1",
+		Command: "cat",
+		Stdin:   base64.StdEncoding.EncodeToString([]byte("segredo-por-stdin\n")),
+	}, nil)
+
+	if res.ExitCode != 0 {
+		t.Fatalf("esperava exit 0, veio %d (%s)", res.ExitCode, res.Error)
+	}
+	if !strings.Contains(res.Output, "segredo-por-stdin") {
+		t.Fatalf("o stdin não chegou ao comando: %q", res.Output)
+	}
+	// E o segredo NÃO aparece na string do comando — que é o ponto inteiro.
+	if strings.Contains("cat", "segredo") {
+		t.Fatal("o segredo não pode estar no comando")
+	}
+}
+
+func TestExecute_NoStdinStillGetsEOF(t *testing.T) {
+	// Um comando que lê stdin tem de receber EOF em vez de travar até o
+	// timeout — o comportamento de antes, preservado.
+	e := testExecutor(t)
+	res := e.Execute(context.Background(), Command{
+		ID: "c2", Command: "cat", TimeoutSeconds: 5,
+	}, nil)
+	if res.TimedOut {
+		t.Fatal("sem stdin, `cat` deve receber EOF e terminar, não estourar o timeout")
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("esperava exit 0, veio %d", res.ExitCode)
+	}
+}
+
+func TestExecute_MalformedStdinFailsLoudly(t *testing.T) {
+	// Base64 quebrada não pode virar stdin vazio: `docker login` perguntaria a
+	// senha e penduraria até o timeout, o que se lê como "o painel quebrou".
+	e := testExecutor(t)
+	res := e.Execute(context.Background(), Command{
+		ID: "c3", Command: "cat", Stdin: "!!! isto não é base64 !!!",
+	}, nil)
+	if res.ExitCode != ExitSpawnFailed {
+		t.Fatalf("esperava falha de spawn, veio exit %d", res.ExitCode)
+	}
+	if !strings.Contains(res.Error, "stdin") {
+		t.Fatalf("o erro precisa dizer que foi o stdin: %q", res.Error)
 	}
 }

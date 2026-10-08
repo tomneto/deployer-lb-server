@@ -19,6 +19,7 @@
 package runner
 
 import (
+	"encoding/base64"
 	"strings"
 	"time"
 )
@@ -99,6 +100,31 @@ type Command struct {
 	// Env are extra environment variables for this command, on top of the
 	// runner's own environment.
 	Env map[string]string `json:"env"`
+
+	// Stdin is base64 of the bytes to feed the command's standard input.
+	//
+	// It exists so a secret never has to ride the command string. Before this
+	// field the panel embedded the payload as a here-document inside Command,
+	// and that string becomes the argv of `/bin/sh -c` on this machine —
+	// readable by `ps -ww` to every user on the box. `docker login
+	// --password-stdin` was the case that made it matter: the password stayed
+	// out of docker's own argv and landed in the shell's instead.
+	//
+	// Base64 and not raw bytes because the envelope is JSON, and a credential
+	// is not guaranteed to be valid UTF-8.
+	Stdin string `json:"stdin"`
+}
+
+// StdinBytes decodes Stdin, or returns nil when there is none.
+//
+// A malformed payload is an error and not an empty stdin: feeding the command
+// nothing would make `docker login` prompt and then hang until the timeout,
+// which reads like the panel is broken rather than like the envelope was.
+func (c Command) StdinBytes() ([]byte, error) {
+	if c.Stdin == "" {
+		return nil, nil
+	}
+	return base64.StdEncoding.DecodeString(c.Stdin)
 }
 
 // Streaming reports whether the output of this command must be shipped

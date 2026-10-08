@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"bufio"
 	"context"
 	"errors"
@@ -165,9 +166,20 @@ func (e *Executor) Execute(ctx context.Context, c Command, sink LogSink) Result 
 	cmd := exec.Command(sh, flag, c.Command)
 	cmd.Dir = e.resolveWorkdir(c)
 	cmd.Env = e.env(c)
-	// Nothing on this machine's stdin belongs to a command from the panel, and
-	// a command that reads stdin must get EOF rather than block forever.
-	cmd.Stdin = nil
+	// O stdin da MÁQUINA nunca pertence a um comando do painel; o que pode
+	// pertencer é o que o painel mandou no campo `stdin`. Sem ele, EOF — um
+	// comando que lê stdin tem de receber fim de arquivo em vez de travar.
+	stdin, err := c.StdinBytes()
+	if err != nil {
+		res.ExitCode = ExitSpawnFailed
+		res.Error = fmt.Sprintf("stdin: %v", err)
+		return finish()
+	}
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	} else {
+		cmd.Stdin = nil
+	}
 	isolateProcessGroup(cmd)
 
 	// One pipe for both streams: interleaving is what makes a build log
