@@ -34,8 +34,11 @@ type Config struct {
 	// fallback since before this field was ever populated, so a handler that
 	// refused on an empty value would be refusing on a configuration that
 	// demonstrably works in production.
-	MainConf     string
-	TemplatePath string        // e.g. /etc/nginx/lb-templates/nginx-app.conf.tmpl
+	MainConf string
+	// TemplatePath is an OVERRIDE. Empty — the normal case — renders the
+	// template compiled into the binary (package conf), so the two can never
+	// be out of step on a host. See conf/embed.go for why that mattered.
+	TemplatePath string
 	MaxBodyBytes int64         // ~64KB per §2.3
 	TSWindow     time.Duration // +/-30s per §2.3
 	NonceTTL     time.Duration // how long nonces are remembered
@@ -144,6 +147,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/health", s.handleHealth)
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/dump", s.handleDump)
+	mux.HandleFunc("/v1/fidelity", s.handleFidelity)
 	mux.HandleFunc("/v1/apply", s.handleApply)
 	mux.HandleFunc("/v1/app/", s.handleDeleteApp)
 	mux.HandleFunc("/v1/pool", s.handlePool)
@@ -162,7 +166,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "invalid"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
+	// `capabilities` existe para o central PERGUNTAR em vez de tentar e falhar.
+	//
+	// Um payload que usa um recurso que este listener não entende leva 400, e
+	// o lb_sync_worker marca 400 como FAILED sem retry: o deploy fica para
+	// trás e só um humano o traz de volta. Durante um rollout canário — um
+	// host por vez, dez minutos por ciclo — essa janela dura horas. Poder
+	// consultar antes transforma "queimei o item do outbox" em "segurei".
+	//
+	// Strings de recurso, nunca um número de versão que o chamador tenha de
+	// mapear: elas não vazam nada (o endpoint é sem auth) e continuam
+	// significando a mesma coisa quando as versões deixarem de ser lineares.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"version":      version.Version,
+		"capabilities": render.Capabilities(),
+	})
 }
 
 // ---- GET /v1/dump (bearer required, no HMAC) ----
@@ -193,6 +212,20 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Onde este listener escreve, e o que há lá. Vai na resposta em TODOS os
+	// caminhos, inclusive no de erro: é justamente quando a leitura da config
+	// falha que saber qual diretório deveria estar sendo incluído importa.
+	confFiles, confErr := s.confDirFiles()
+	mainConf := s.cfg.MainConf
+	if mainConf == "" {
+		// Mesmo default que ReadConfTree já aplica logo abaixo. Reportar ""
+		// faria o painel dizer "não sei" sobre um arquivo que acabou de ser
+		// lido. (ConfDir NÃO ganha default aqui de propósito: ele é usado em
+		// caminho de escrita, e vazio ali tem de continuar significando
+		// "não configurado".)
+		mainConf = "/etc/nginx/nginx.conf"
+	}
+
 	source := "nginx -T"
 	dump, err := s.cfg.Runner.DumpConfig()
 	if err != nil {
@@ -210,6 +243,11 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"status": "error", "error": err.Error(), "raw": dump,
 				"source": source, "pools": []any{}, "vhosts": []any{},
+				"files":          []any{},
+				"conf_dir":       s.cfg.ConfDir,
+				"main_conf":      mainConf,
+				"conf_dir_files": confFiles,
+				"conf_dir_error": confErr,
 			})
 			return
 		}
@@ -219,6 +257,16 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 	inv := nginx.BuildInventory(dump)
 	inv.ResolvePools()
 	s.probePools(inv.Pools)
+
+	// `files` é a lista COMPLETA do que foi carregado, não só o que declara
+	// vhost ou upstream. A diferença é o diagnóstico: um arquivo que só tem
+	// `include` ou um `map` não aparece em pools/vhosts, e concluir a partir
+	// da ausência deles mediria menos do que parece.
+	files := nginx.ParseDump(dump)
+	if files == nil {
+		files = []nginx.FileBlock{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"version": version.Version,
@@ -226,6 +274,13 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 		"pools":   inv.Pools,
 		"vhosts":  inv.Vhosts,
 		"raw":     dump,
+		// Os quatro campos que deixam o painel nomear a causa em vez de só
+		// mostrar o sintoma. Ver dumpfiles.go.
+		"files":          files,
+		"conf_dir":       s.cfg.ConfDir,
+		"main_conf":      mainConf,
+		"conf_dir_files": confFiles,
+		"conf_dir_error": confErr,
 	})
 }
 
@@ -474,7 +529,7 @@ func (s *Server) runApplyLocked(p render.Payload) (int, map[string]any) {
 		return status, body
 	}
 
-	rendered, err := render.Render(s.cfg.TemplatePath, p)
+	rendered, err := s.renderVhost(p)
 	if err != nil {
 		return http.StatusBadRequest, map[string]any{
 			"status": "invalid",

@@ -14,11 +14,37 @@ dependencies, WireGuard, the binary itself, config, and the systemd unit.
   that POSTs reports to the backoffice intake.
 - `internal/lbserver`, `internal/nginx`, `internal/render` — LB-mode config
   rendering/reload.
-- `conf/nginx-app.conf.tmpl` — the managed vhost template. It carries
-  `client_max_body_size 100m;` on purpose: nginx defaults to 1m, which is
-  below the 3MB slices the backend's chunked upload sends, so uploads got a
-  bare 413 from the proxy. 100m matches Cloudflare's Free/Pro cap and leaves
-  the real ceiling to the application. Do not drop it.
+- `conf/nginx-app.conf.tmpl` — the managed vhost template, **compiled into
+  the binary** via `conf/embed.go`. It carries `client_max_body_size 100m;` on
+  purpose: nginx defaults to 1m, which is below the 3MB slices the backend's
+  chunked upload sends, so uploads got a bare 413 from the proxy. 100m matches
+  Cloudflare's Free/Pro cap and leaves the real ceiling to the application. Do
+  not drop it.
+
+  `setup.sh` still installs the file under `/etc/nginx/lb-templates/`, but that
+  copy is now documentation, not the source: `NGINX_TEMPLATE_PATH` is an
+  explicit override and defaults to empty. The reason is skew. Template and
+  binary used to ship as two independent artifacts, and `text/template` has no
+  tolerance for a field it does not know — a template referencing a method a
+  older binary lacks fails at Execute, which `runApplyLocked` turns into a 400,
+  which `lb_sync_worker` marks FAILED with no retry. One stale file would have
+  silently broken *every* apply on that host. The listener now renders a probe
+  payload at boot and refuses to start if it fails, so a bad override halts the
+  fleet's canary instead of poisoning applies one pipeline at a time.
+
+- Managed vhosts can declare several `location` blocks (`locations` in the
+  apply payload, schema_version 2): `=`, `^~`, `~`, `~*` and prefix matchers,
+  plus `proxy_pass` to an external destination. Validation is a strict
+  allowlist in `internal/render/locations.go` — everything there becomes nginx
+  config verbatim, so a `;` or `}` slipping through would be arbitrary config
+  injection. Named locations (`@name`) and disk serving (`root`) are
+  deliberately NOT supported; the reasons are in that file.
+
+- `GET /v1/fidelity` answers "could the managed template reproduce the vhosts
+  this nginx actually serves, and what would be lost trying". Read-only by
+  contract: it never emits a ready-to-apply payload, because the classifier
+  sits on top of a tolerant parser and must not become a writer of production
+  config. An unrecognised directive counts AGAINST a vhost, never in favour.
 - `internal/provision`, `internal/version`, `internal/auth` — shared
   provisioning/versioning/auth helpers.
 - `setup.sh` — the idempotent installer driven over SSH by selfApi's

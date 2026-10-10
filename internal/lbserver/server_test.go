@@ -572,3 +572,140 @@ func TestStatusRequiresBearerButNotHMAC(t *testing.T) {
 		t.Fatal("expected wg field (stub) in status response")
 	}
 }
+
+// ──────────── Locations: a ordem é a garantia, não o template ────────────
+
+// A promessa de §2.3 é "validação ANTES de qualquer escrita". O render não
+// valida nada — ele escreve o que recebe —, então quem a cumpre é esta ordem
+// no handler. Um teste no pacote render não conseguiria provar isso: lá não
+// existe disco.
+func TestApplyRejectsHostileLocationWithoutTouchingConfDir(t *testing.T) {
+	srv, confDir := newTestServer(t, nil)
+
+	before, err := os.ReadDir(confDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	srv.cfg.Now = func() time.Time { return now }
+
+	p := validPayload(1, "")
+	p.SchemaVersion = render.CurrentSchemaVersion
+	p.Locations = []render.LocationSpec{
+		{Path: "/x; return 444; location / { proxy_pass http://evil"},
+	}
+
+	req := signedApplyRequest(t, now, testSecret, testToken, p)
+	status, body := doApply(t, srv, req)
+	if status != http.StatusBadRequest {
+		t.Fatalf("esperava 400 para location hostil, veio %d: %v", status, body)
+	}
+
+	after, err := os.ReadDir(confDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("o conf dir foi tocado por um payload recusado: %d -> %d",
+			len(before), len(after))
+	}
+}
+
+// Um listener que entende locations tem de dizer isso, senão o central só
+// descobre tentando — e tentar custa um item de outbox marcado FAILED.
+func TestHealthAdvertisesCapabilities(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+	mux := http.NewServeMux()
+	srv.Routes(mux)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/health", nil))
+
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	caps, _ := body["capabilities"].([]any)
+	found := false
+	for _, c := range caps {
+		if c == "locations.v1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("capabilities não anuncia locations: %v", body["capabilities"])
+	}
+}
+
+// O /v1/status reconstrói o estado de cada app RELENDO os arquivos de conf.d,
+// e não de memória — é o que o mantém correto depois de um restart. Se a forma
+// nova do template quebrasse essa releitura, o painel passaria a mostrar um LB
+// sem domínios logo depois de aplicar um vhost com várias rotas.
+func TestParseManagedConfAgainstRenderedMultiLocation(t *testing.T) {
+	p := validPayload(9, "")
+	p.SchemaVersion = render.CurrentSchemaVersion
+	p.Domains = []string{"app-a.workspacefy.com", "www.app-a.workspacefy.com"}
+	p.Upstreams = []render.Upstream{
+		{IP: "10.10.0.2", Port: 10200},
+		{IP: "10.10.0.3", Port: 10200},
+	}
+	p.Locations = []render.LocationSpec{
+		{Matcher: "=", Path: "/health_check"},
+		{Matcher: "~", Path: `^/api/`},
+		{Path: "/externo", ProxyPass: "https://www.example.com"},
+		{Path: "/"},
+	}
+	if errs := render.ValidatePayload(&p); len(errs) > 0 {
+		t.Fatalf("payload de teste inválido: %v", errs)
+	}
+
+	out, err := render.Render("../../conf/nginx-app.conf.tmpl", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mc, ok := nginx.ParseManagedConf(out)
+	if !ok {
+		t.Fatal("o arquivo renderizado deixou de ser reconhecido como gerido")
+	}
+	if mc.App != "app-a" || mc.Revision != 9 {
+		t.Errorf("cabeçalho mal lido: app=%q revision=%d", mc.App, mc.Revision)
+	}
+	if len(mc.Domains) != 2 {
+		t.Errorf("domínios = %v", mc.Domains)
+	}
+	// O `proxy_pass https://www.example.com;` da rota externa NÃO pode virar
+	// upstream: a regex do manifesto casa `server <host>:<porta>;`, e um
+	// destino externo não é um backend que este sistema conheça ou monitore.
+	if len(mc.Upstreams) != 2 {
+		t.Errorf("upstreams = %v (o destino externo não é backend)", mc.Upstreams)
+	}
+}
+
+// Um vhost 100% externo não declara upstream nenhum, e o manifesto tem de
+// tolerar isso em vez de recusar o arquivo — senão o app some do /v1/status.
+func TestParseManagedConfToleratesVhostWithNoUpstreams(t *testing.T) {
+	p := validPayload(3, "")
+	p.SchemaVersion = render.CurrentSchemaVersion
+	p.Upstreams = nil
+	p.Locations = []render.LocationSpec{
+		{Path: "/", ProxyPass: "https://www.example.com"},
+	}
+	if errs := render.ValidatePayload(&p); len(errs) > 0 {
+		t.Fatalf("payload de teste inválido: %v", errs)
+	}
+	out, err := render.Render("../../conf/nginx-app.conf.tmpl", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mc, ok := nginx.ParseManagedConf(out)
+	if !ok {
+		t.Fatal("vhost sem upstream deixou de ser reconhecido como gerido")
+	}
+	if len(mc.Upstreams) != 0 {
+		t.Errorf("upstreams = %v, queria vazio", mc.Upstreams)
+	}
+	if len(mc.Domains) != 1 {
+		t.Errorf("domínios = %v", mc.Domains)
+	}
+}
