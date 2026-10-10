@@ -33,11 +33,14 @@ func envOr(key, def string) string {
 
 func main() {
 	var (
-		addr         = flag.String("addr", envOr("LB_LISTEN_ADDR", "127.0.0.1:8443"), "listen address (bind to 127.0.0.1 or the wg0 interface, never public — §2.3)")
-		token        = flag.String("token", envOr("LB_TOKEN", ""), "shared bearer token")
-		secret       = flag.String("secret", envOr("LB_SHARED_SECRET", ""), "HMAC shared secret")
-		confDir      = flag.String("conf-dir", envOr("NGINX_CONF_DIR", "/etc/nginx/conf.d"), "nginx conf.d directory this listener manages")
-		templatePath = flag.String("template", envOr("NGINX_TEMPLATE_PATH", "/etc/nginx/lb-templates/nginx-app.conf.tmpl"), "path to the nginx-app.conf.tmpl template")
+		addr    = flag.String("addr", envOr("LB_LISTEN_ADDR", "127.0.0.1:8443"), "listen address (bind to 127.0.0.1 or the wg0 interface, never public — §2.3)")
+		token   = flag.String("token", envOr("LB_TOKEN", ""), "shared bearer token")
+		secret  = flag.String("secret", envOr("LB_SHARED_SECRET", ""), "HMAC shared secret")
+		confDir = flag.String("conf-dir", envOr("NGINX_CONF_DIR", "/etc/nginx/conf.d"), "nginx conf.d directory this listener manages")
+		// Vazio = o template compilado no binário, que é o caminho normal.
+		// Um valor aqui é override deliberado, e o boot confere se ele
+		// executa antes de o serviço aceitar qualquer apply. Ver conf/embed.go.
+		templatePath = flag.String("template", envOr("NGINX_TEMPLATE_PATH", ""), "override: path to an nginx-app.conf.tmpl on disk (default: the template compiled into this binary)")
 		mainConf     = flag.String("main-conf", envOr("NGINX_MAIN_CONF", "/etc/nginx/nginx.conf"), "the host's main nginx.conf — read for /v1/dump's fallback, and written by /v1/pool")
 		maxBodyBytes = flag.Int64("max-body-bytes", 64*1024, "max accepted request body size in bytes")
 		tsWindow     = flag.Duration("ts-window", 30*time.Second, "allowed clock skew for X-Payload-Ts")
@@ -73,10 +76,23 @@ func main() {
 		Logger:       logger,
 	})
 
+	// Antes de aceitar o primeiro apply: o template que este binário usaria
+	// executa? Um template que não executa viraria 400 em TODO apply deste
+	// host, e o worker marca 400 como FAILED sem retry — falha silenciosa e
+	// permanente. Morrer aqui faz o canário da frota travar o rollout, que é
+	// o comportamento que já existe para isso.
+	if err := srv.VerifyTemplate(); err != nil {
+		log.Fatalf("deployer-lb-server: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 
-	logger.Printf("deployer-lb-server %s listening on %s (conf-dir=%s template=%s)", version.Version, *addr, *confDir, *templatePath)
+	templateSource := "embutido no binário"
+	if *templatePath != "" {
+		templateSource = *templatePath
+	}
+	logger.Printf("deployer-lb-server %s listening on %s (conf-dir=%s template=%s)", version.Version, *addr, *confDir, templateSource)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatalf("deployer-lb-server: %v", err)
 	}

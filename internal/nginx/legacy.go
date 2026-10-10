@@ -12,11 +12,19 @@ var (
 )
 
 // FileBlock is one file's worth of parsed `nginx -T` output.
+//
+// The JSON tags exist because this is also the answer to "which files did
+// nginx actually load", which GET /v1/dump reports. That question is half of
+// "does the main nginx.conf include the directory this listener writes to" —
+// on a host where it does not, every byte of traffic is served from files this
+// listener never wrote, and the panel used to show the symptom without ever
+// being able to name the cause. Serializing the primitive that already exists
+// beats a second parser that can disagree with this one.
 type FileBlock struct {
-	File        string
-	Managed     bool
-	App         string
-	ServerNames []string
+	File        string   `json:"file"`
+	Managed     bool     `json:"managed"`
+	App         string   `json:"app,omitempty"`
+	ServerNames []string `json:"server_names,omitempty"`
 }
 
 // ParseDump splits `nginx -T` output into per-file blocks, tagging each as
