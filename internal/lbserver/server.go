@@ -151,6 +151,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/apply", s.handleApply)
 	mux.HandleFunc("/v1/app/", s.handleDeleteApp)
 	mux.HandleFunc("/v1/pool", s.handlePool)
+	mux.HandleFunc("/v1/include", s.handleInclude)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
