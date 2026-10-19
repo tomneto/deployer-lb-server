@@ -71,6 +71,10 @@ shift || true
 # lb-mode options
 LB_PORT="127.0.0.1:8443"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
+# O nginx.conf do host. Só é lido/editado por ensure_conf_dir_included, que é
+# a diferença entre um LB que nasce ligado e um que nasce escrevendo arquivo
+# que o nginx nunca lê.
+NGINX_MAIN_CONF="/etc/nginx/nginx.conf"
 NGINX_TEMPLATE_DIR="/etc/nginx/lb-templates"
 NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
 NGINX_MIN_VERSION="1.18.0"
@@ -201,6 +205,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port) LB_PORT="$2"; shift 2 ;;
         --nginx-conf-dir) NGINX_CONF_DIR="$2"; shift 2 ;;
+        --nginx-main-conf) NGINX_MAIN_CONF="$2"; shift 2 ;;
         --lb-token) LB_TOKEN="$2"; shift 2 ;;
         --lb-secret) LB_SECRET="$2"; shift 2 ;;
         --intake-url) INTAKE_URL="$2"; shift 2 ;;
@@ -1028,6 +1033,96 @@ EOF
     fi
 }
 
+# ---------------------------------------------------------------------------
+# O include que faz o nginx ler o que este listener escreve.
+#
+# Sem esta linha o LB nasce DESCONECTADO: o listener escreve cada apply em
+# $NGINX_CONF_DIR, o nginx.conf nunca inclui esse diretório, e os arquivos
+# ficam no disco sem efeito. Nada acusa — a config é válida, o reload passa, o
+# tráfego segue na config escrita à mão —, então o deploy parece aplicado e não
+# está. Foi exatamente assim que o LB de produção passou meses.
+#
+# MEDE em vez de adivinhar: `nginx -T` lista os arquivos que o nginx carregou,
+# e a pergunta "ele lê este diretório" se responde procurando um deles lá
+# dentro. Por isso esta função roda DEPOIS do catch-all (00-default.conf): com
+# o diretório vazio, "nenhum arquivo carregado está lá" também é o que se vê
+# num nginx que inclui o diretório corretamente, e não se pode decidir nada.
+# ---------------------------------------------------------------------------
+ensure_conf_dir_included() {
+    local dir="${NGINX_CONF_DIR%/}"
+    local main="$NGINX_MAIN_CONF"
+    local dump
+
+    [[ -f "$main" ]] || {
+        log "warning: $main não existe — não há onde escrever o include de $dir"
+        return 0
+    }
+
+    if ! dump="$(nginx -T 2>/dev/null)"; then
+        # Config inválida ou sandbox impedindo a sonda. O `nginx -t || die` no
+        # fim do step4 é quem reporta o primeiro caso; aqui o certo é não
+        # escrever no nginx.conf de alguém com base em medição que não houve.
+        log "warning: 'nginx -T' não rodou — não dá para medir se $dir é incluído; verifique manualmente"
+        return 0
+    fi
+
+    if grep -qE "^# configuration file ${dir}/" <<<"$dump"; then
+        log "$dir já é incluído por $main, OK"
+        return 0
+    fi
+
+    local backup="${main%/*}/.${main##*/}.bak-$(date -u +%Y%m%d-%H%M%S)"
+    cp -p "$main" "$backup"
+
+    # A linha entra por ÚLTIMO dentro do bloco http: o nginx escolhe o vhost
+    # por server_name, mas em empate vence quem foi declarado primeiro. Entrar
+    # por último significa que, num host que já serve tráfego, quem continua
+    # respondendo é o que responde hoje.
+    local tmp awk_status=0
+    tmp="$(mktemp)"
+    awk -v inc="    include ${dir}/*.conf;" '
+        BEGIN { depth = 0; inhttp = 0; done = 0 }
+        {
+            if (!done && !inhttp && $0 ~ /^[ \t]*http[ \t]*\{/) { inhttp = 1; depth = 0 }
+            if (inhttp && !done && depth == 1 && $0 ~ /^[ \t]*\}/) {
+                print "    # include adicionado pelo setup.sh do deployer-lb-server"
+                print inc
+                done = 1
+                inhttp = 0
+            }
+            if (inhttp) {
+                opens = gsub(/\{/, "{")
+                closes = gsub(/\}/, "}")
+                depth += opens - closes
+            }
+            print
+        }
+        END { exit(done ? 0 : 3) }
+    ' "$main" > "$tmp" || awk_status=$?
+    # `|| awk_status=$?` e não `local x=$?` na linha seguinte: com
+    # `set -e` o awk saindo 3 derrubaria o script inteiro antes de
+    # qualquer tratamento, e provisionar não pode morrer porque um
+    # nginx.conf tem formato inesperado.
+    awk_status="${awk_status:-0}"
+
+    if [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$tmp" "$backup"
+        log "warning: não achei o bloco http {} em $main — este LB vai escrever em $dir sem que o nginx leia. Acrescente 'include ${dir}/*.conf;' dentro do http e recarregue."
+        return 0
+    fi
+
+    cat "$tmp" > "$main"
+    rm -f "$tmp"
+
+    if ! nginx -t >/dev/null 2>&1; then
+        cat "$backup" > "$main"
+        log "warning: 'nginx -t' reprovou com o include de $dir — $main foi restaurado do backup $backup"
+        return 0
+    fi
+
+    log "incluí $dir em $main (backup em $backup)"
+}
+
 step4_config_lb() {
     log "step 4/6: config (template, snippets, default_server catch-all)"
     mkdir -p "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR" "$NGINX_CONF_DIR"
@@ -1053,6 +1148,11 @@ server {
 EOF
         log "wrote default_server catch-all at $default_conf"
     fi
+
+    # Depois do catch-all de propósito: só com algo no diretório é que a
+    # medição por `nginx -T` consegue distinguir "não incluído" de "nada para
+    # incluir".
+    ensure_conf_dir_included
 
     write_lb_env
     open_firewalld_port 80 tcp
