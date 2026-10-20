@@ -64,6 +64,48 @@ ldflags from `git describe --tags --always --dirty` — see
 `internal/version/version.go`. `setup.sh` (and `release.yml`) build with the
 same ldflags.
 
+## Releases — toda alteração precisa de uma tag
+
+**Mudou o que o alvo instala (os binários ou o `setup.sh`), corte uma tag
+anotada.** Sem ela a alteração existe no GitHub e não chega a host nenhum.
+
+O motivo está no `download_or_build_binary` do `setup.sh`, que resolve o
+binário em três degraus:
+
+1. `bin/<nome>` dentro do checkout, quando a central pré-compilou — e **só**
+   quando o carimbo de `<binário> -v` bate com o `git describe` do checkout,
+   para um binário deixado ali antes de um `git pull` não ser reinstalado
+   como se fosse novo;
+2. o asset `<nome>-linux-<goarch>` de `releases/latest/download`;
+3. `go build` no próprio alvo, que exige Go num host que frequentemente não
+   tem.
+
+O degrau 2 é o normal, e ele diz `latest`: sem tag nova, todo alvo que não
+recebeu um pré-compilado instala a release anterior. Nada falha, nada avisa
+— o painel mostra "deployer atualizado" e o host segue com o binário velho.
+Foi exatamente assim que a rota `/v1/include` passou a existir no `main` e o
+LB de produção continuou respondendo 404 nela.
+
+Cortar a release:
+
+```
+git tag -a v0.6.4 -m "o que mudou, em prosa, para quem vai decidir se rola"
+git push origin v0.6.4
+```
+
+A tag tem de ser **anotada** (`-a`): o `release.yml` usa a anotação como
+corpo das notas da release (`git tag -l --format='%(contents)'`), e uma tag
+leve não tem anotação — a release sai com a lista de commits gerada e nada
+mais, que não diz a um operador se o agente novo pode ir para produção.
+
+O resto é automático: o workflow compila os quatro binários para amd64 e
+arm64, confere que todo asset está no disco antes de publicar (uma release
+vazia degradaria em silêncio para "todo alvo compila Go ao provisionar") e
+publica com os nomes que o `setup.sh` busca.
+
+Depois da release, "Atualizar deployer" no backoffice entrega o binário
+novo. Antes dela, não entrega.
+
 ## Tests
 
 Three tiers, by cost and where each one runs.
