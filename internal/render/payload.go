@@ -18,9 +18,24 @@ import (
 // about it changed.
 const SupportedSchemaVersion = 1
 
-// CurrentSchemaVersion is what a sender uses when it needs a feature this
-// listener gained after v1 (today: `locations`).
-const CurrentSchemaVersion = 2
+// Each feature added after v1 names its OWN version, and the checks below
+// compare against that one — never against "the current version".
+//
+// The difference is not cosmetic. While `locations` was the only feature, its
+// check read `p.SchemaVersion < CurrentSchemaVersion`, which happened to be
+// right and stopped being right the moment a second feature arrived: bumping
+// the constant would have started refusing every valid v2 payload carrying
+// locations, because they declare 2 and the check would demand 3. A feature's
+// requirement is the version IT was added in, forever.
+const (
+	// LocationsSchemaVersion is when `locations` arrived.
+	LocationsSchemaVersion = 2
+	// StreamingSchemaVersion is when `streaming` arrived.
+	StreamingSchemaVersion = 3
+)
+
+// CurrentSchemaVersion is the newest contract this listener speaks.
+const CurrentSchemaVersion = StreamingSchemaVersion
 
 // SupportedSchemaVersions is a SET, deliberately, and not a bumped constant.
 //
@@ -41,7 +56,8 @@ const CurrentSchemaVersion = 2
 // addition, forever, which is the opposite of what tolerant decoding is for.
 var SupportedSchemaVersions = map[int]bool{
 	SupportedSchemaVersion: true,
-	CurrentSchemaVersion:   true,
+	LocationsSchemaVersion: true,
+	StreamingSchemaVersion: true,
 }
 
 // Capabilities is what GET /v1/health advertises, so a sender can find out
@@ -51,7 +67,7 @@ var SupportedSchemaVersions = map[int]bool{
 // leak nothing (the endpoint is unauthenticated) and they stay meaningful
 // when versions stop being linear.
 func Capabilities() []string {
-	return []string{"locations.v1"}
+	return []string{"locations.v1", "streaming.v1"}
 }
 
 // Upstream is one backend pool member. IP is always the target's
@@ -113,6 +129,23 @@ func (r RateLimitConfig) Resolved() RateLimitConfig {
 	return r
 }
 
+// StreamingConfig turns off the response buffer, for backends that answer a
+// piece at a time.
+//
+// With nginx buffering — the default — a response is held until it is whole or
+// the buffer fills, so a token stream, an SSE channel or a long export arrives
+// in lumps or all at once. `proxy_buffering off` plus
+// `chunked_transfer_encoding off` is the pair ollama, livekit, n8n and play
+// all hand-wrote, which is exactly why those vhosts read as "o painel não
+// reproduz": the template had no way to say it.
+//
+// Opt-in per pipeline. Buffering is the right default for ordinary responses —
+// it frees the upstream worker as soon as nginx has the bytes — and turning it
+// off everywhere would hold a backend connection open for every slow client.
+type StreamingConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
 // Payload is the exact JSON body of POST /v1/apply, per pipe-improves.md §2.2.
 type Payload struct {
 	SchemaVersion  int             `json:"schema_version"`
@@ -126,6 +159,7 @@ type Payload struct {
 	Websocket      bool            `json:"websocket"`
 	Cache          CacheConfig     `json:"cache"`
 	RateLimit      RateLimitConfig `json:"rate_limit"`
+	Streaming      StreamingConfig `json:"streaming"`
 	Timeouts       Timeouts        `json:"timeouts"`
 	CorpOrigin     bool            `json:"corp_origin"`
 	// Locations vazio renderiza o `location /` de sempre, byte a byte. Ver
@@ -163,13 +197,19 @@ func ValidatePayload(p *Payload) []string {
 	if !SupportedSchemaVersions[p.SchemaVersion] {
 		errs = append(errs, fmt.Sprintf("unsupported schema_version: %d", p.SchemaVersion))
 	}
-	// `locations` é a única coisa que exige v2. Aceitá-lo num payload que se
-	// declara v1 deixaria o sender achar que um listener antigo o entenderia —
-	// e é justamente esse engano que a versão existe para impedir.
-	if len(p.Locations) > 0 && p.SchemaVersion < CurrentSchemaVersion {
+	// Cada recurso exige a versão em que ELE entrou. Aceitar um deles num
+	// payload que se declara anterior deixaria o sender achar que um listener
+	// antigo o entenderia — e é justamente esse engano que a versão existe
+	// para impedir.
+	if len(p.Locations) > 0 && p.SchemaVersion < LocationsSchemaVersion {
 		errs = append(errs, fmt.Sprintf(
 			"locations require schema_version %d, got %d",
-			CurrentSchemaVersion, p.SchemaVersion))
+			LocationsSchemaVersion, p.SchemaVersion))
+	}
+	if p.Streaming.Enabled && p.SchemaVersion < StreamingSchemaVersion {
+		errs = append(errs, fmt.Sprintf(
+			"streaming requires schema_version %d, got %d",
+			StreamingSchemaVersion, p.SchemaVersion))
 	}
 	if p.Revision <= 0 {
 		errs = append(errs, "revision must be a positive integer")

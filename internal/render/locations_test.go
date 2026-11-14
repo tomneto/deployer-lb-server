@@ -243,20 +243,53 @@ func TestSchemaVersion_LocationsRequireV2(t *testing.T) {
 	}
 }
 
-func TestSchemaVersion_AcceptsOneAndTwoRejectsTheRest(t *testing.T) {
-	for _, v := range []int{SupportedSchemaVersion, CurrentSchemaVersion} {
+func TestSchemaVersion_AcceptsTheDeclaredSetAndRejectsTheRest(t *testing.T) {
+	for _, v := range []int{SupportedSchemaVersion, LocationsSchemaVersion, StreamingSchemaVersion} {
 		p := validPayload()
 		p.SchemaVersion = v
 		if errs := ValidatePayload(&p); len(errs) > 0 {
 			t.Errorf("schema_version %d devia ser aceita: %v", v, errs)
 		}
 	}
-	for _, v := range []int{0, 3, -1} {
+	for _, v := range []int{0, 4, -1} {
 		p := validPayload()
 		p.SchemaVersion = v
 		if errs := ValidatePayload(&p); len(errs) == 0 {
 			t.Errorf("schema_version %d devia ser recusada", v)
 		}
+	}
+}
+
+// Um recurso exige a versão em que ELE entrou, não a mais nova.
+//
+// Enquanto `locations` era o único, a checagem dele comparava com
+// CurrentSchemaVersion — o que era certo por coincidência e deixou de ser no
+// instante em que um segundo recurso apareceu: subir a constante passaria a
+// recusar todo payload v2 legítimo, que declara 2 e veria a exigência virar 3.
+func TestAFeatureRequiresTheVersionItArrivedIn(t *testing.T) {
+	withLocations := validPayload()
+	withLocations.SchemaVersion = LocationsSchemaVersion
+	withLocations.Locations = []LocationSpec{{Path: "/"}}
+	if errs := ValidatePayload(&withLocations); len(errs) > 0 {
+		t.Errorf("locations em v%d devia ser aceito: %v", LocationsSchemaVersion, errs)
+	}
+
+	streamingTooOld := validPayload()
+	streamingTooOld.SchemaVersion = LocationsSchemaVersion
+	streamingTooOld.Streaming = StreamingConfig{Enabled: true}
+	errs := ValidatePayload(&streamingTooOld)
+	if len(errs) == 0 {
+		t.Fatal("streaming num payload v2 passou — um listener antigo o descartaria em silêncio")
+	}
+	if !strings.Contains(strings.Join(errs, " "), "streaming") {
+		t.Fatalf("o erro não nomeia o recurso: %v", errs)
+	}
+
+	streaming := validPayload()
+	streaming.SchemaVersion = StreamingSchemaVersion
+	streaming.Streaming = StreamingConfig{Enabled: true}
+	if errs := ValidatePayload(&streaming); len(errs) > 0 {
+		t.Errorf("streaming em v%d devia ser aceito: %v", StreamingSchemaVersion, errs)
 	}
 }
 

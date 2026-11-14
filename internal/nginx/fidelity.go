@@ -115,6 +115,12 @@ var expressible = map[string][]string{
 		"snippets/cloudflare-real-ip.conf",
 	},
 	"add_header": {"X-Cache-Status $upstream_cache_status"},
+	// Só `off`: o template emite essas duas sob Streaming.Enabled, e nunca as
+	// emite com `on`. Um vhost que diz `on` explicitamente está pedindo o
+	// padrão do nginx por escrito, e o template não produz essa linha — é
+	// perda de valor, não bloqueio.
+	"proxy_buffering":           {"off"},
+	"chunked_transfer_encoding": {"off"},
 	"proxy_set_header": {
 		`Connection ""`,
 		"Host $host",
@@ -160,6 +166,25 @@ var blockers = map[string]string{
 	"resolver":             "resolução DNS em runtime, que acompanha proxy_pass com variável",
 	"access_log":           "log próprio deste vhost; o template usa o do servidor",
 	"error_log":            "log próprio deste vhost; o template usa o do servidor",
+
+	// Afinação de cache que o template não parametriza. Ele emite `proxy_cache`,
+	// `proxy_cache_valid` e `proxy_cache_use_stale` com valores fixos, e nada
+	// mais — então uma chave de cache própria ou um lock de revalidação não
+	// cabem nele. Sem estas entradas caíam em "não classificada", o que dá o
+	// mesmo veredito e não diz nada a quem precisa decidir se migra.
+	"proxy_cache_key":          "chave de cache própria; o template usa a chave padrão do nginx",
+	"proxy_cache_lock":         "serializa a revalidação; o template não parametriza o cache a esse nível",
+	"proxy_cache_bypass":       "condição para pular o cache; o template não expressa",
+	"proxy_no_cache":           "condição para não armazenar; o template não expressa",
+	"proxy_cache_methods":      "quais métodos entram no cache; o template usa o padrão",
+	"proxy_cache_min_uses":     "quantos acessos antes de armazenar; o template usa o padrão",
+	"proxy_max_temp_file_size": "limite de spool em disco; acompanha proxy_buffering, que o template não expressa",
+
+	// Respostas que chegam aos poucos — SSE, streaming de LLM, upload longo.
+	// `proxy_buffering off` e `chunked_transfer_encoding off` são o par que
+	// ollama, livekit, n8n e play usam, e é o que separa "o token aparece
+	// enquanto é gerado" de "a resposta inteira chega de uma vez".
+	"proxy_request_buffering": "controla o buffer da REQUISIÇÃO; o template não expressa",
 }
 
 // Fidelity classifies every `server {}` in a dump.
@@ -328,10 +353,52 @@ func classify(line string, lineNo int, context string, curLoc *render.LocationSp
 	// dá para migrar sabendo que este valor muda.
 	record(findings, isBlocker, Finding{
 		Directive: name, Context: context, Line: lineNo,
-		Reason: "o template emite esta diretiva, mas não com este valor — " +
-			"migrar trocaria o valor por " + strings.Join(allowed, " | "),
-		Raw: truncate(line),
+		Reason: lossReason(name, value, allowed),
+		Raw:    truncate(line),
 	}, false)
+}
+
+// multiValued são diretivas que aparecem VÁRIAS vezes no mesmo bloco, cada
+// ocorrência carregando um item próprio — `proxy_set_header Host $host` e
+// `proxy_set_header X-Real-IP $remote_addr` não são dois valores da mesma
+// coisa, são dois cabeçalhos.
+//
+// Sem isso a frase de perda despeja a lista inteira do template: para
+// `proxy_set_header` são sete entradas separadas por `|`, numa linha, e quem
+// precisa decidir se migra não consegue ver QUAL cabeçalho muda.
+var multiValued = map[string]bool{
+	"proxy_set_header": true,
+	"add_header":       true,
+}
+
+// lossReason explica a perda no nível em que ela acontece.
+func lossReason(name, value string, allowed []string) string {
+	if !multiValued[name] {
+		return "o template emite esta diretiva, mas não com este valor — " +
+			"migrar trocaria o valor por " + strings.Join(allowed, " | ")
+	}
+
+	key := firstToken(value)
+	for _, candidate := range allowed {
+		if !strings.EqualFold(firstToken(candidate), key) {
+			continue
+		}
+		// Mesmo nome, valor diferente: a frase nomeia os dois, e só eles.
+		return "o template emite " + key + " com outro valor — migrar trocaria " +
+			"este por `" + candidate + "`"
+	}
+	// Nome que o template não emite de jeito nenhum. Migrar PERDE o cabeçalho,
+	// e dizer qual é a única informação que serve aqui.
+	return "o template não emite " + key + " — migrar perderia este cabeçalho"
+}
+
+// firstToken é o nome do cabeçalho: o que vem antes do primeiro espaço.
+func firstToken(value string) string {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return value
+	}
+	return fields[0]
 }
 
 // externalProxyPass devolve o destino quando ele NÃO é um upstream local.

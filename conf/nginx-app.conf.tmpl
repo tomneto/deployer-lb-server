@@ -68,6 +68,14 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
 {{- end}}
+{{- if $.Streaming.Enabled}}
+        # Respostas que chegam aos poucos: token de LLM, SSE, export longo.
+        # Com o buffer ligado o nginx segura tudo até encher ou terminar, e o
+        # cliente recebe em blocos — o par abaixo é o que ollama, livekit, n8n
+        # e play escreviam à mão.
+        proxy_buffering off;
+        chunked_transfer_encoding off;
+{{- end}}
 
         proxy_connect_timeout {{$.Timeouts.Connect}}s;
         proxy_read_timeout {{$.Timeouts.Read}}s;
