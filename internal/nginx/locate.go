@@ -226,6 +226,34 @@ func (inv *Inventory) AttachRefs(dump string) {
 				End:    span.End,
 				Digest: BlockDigest(span.Text(section)),
 			}.Encode()
+
+			// As rotas deste vhost, pela mesma ordem e pelo mesmo argumento:
+			// o N-ésimo `location` que o lexer acha dentro deste `server` é o
+			// N-ésimo que o inventário listou nele.
+			var locs []Span
+			for _, c := range FlattenSpans(span.Children) {
+				if c.Kind == "location" {
+					locs = append(locs, c)
+				}
+			}
+			li := 0
+			for lj := range v.Locations {
+				if v.Locations[lj].Disabled {
+					continue
+				}
+				if li >= len(locs) {
+					break
+				}
+				lc := locs[li]
+				li++
+				v.Locations[lj].Ref = Ref{
+					File:   file,
+					Kind:   "location",
+					Start:  lc.Header,
+					End:    lc.End,
+					Digest: BlockDigest(lc.Text(section)),
+				}.Encode()
+			}
 		}
 	}
 }

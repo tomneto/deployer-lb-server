@@ -109,6 +109,17 @@ type Location struct {
 	Pool      string `json:"pool,omitempty"`
 	Websocket bool   `json:"websocket,omitempty"`
 	Root      string `json:"root,omitempty"`
+
+	// Mesmo papel que em Vhost: um `location` dentro de uma cerca. Ele
+	// precisa continuar aparecendo, e por um motivo mais agudo que o do
+	// vhost — uma rota desligada não derruba o domínio, ela MOVE o tráfego
+	// para o location mais genérico que casa. Some da tela e ninguém
+	// entende por que `/api` virou a home.
+	Disabled   bool   `json:"disabled,omitempty"`
+	DisabledID string `json:"disabled_id,omitempty"`
+	DisabledAt string `json:"disabled_at,omitempty"`
+	DisabledBy string `json:"disabled_by,omitempty"`
+	Ref        string `json:"ref,omitempty"`
 }
 
 var (
@@ -301,9 +312,7 @@ func BuildInventory(dump string) Inventory {
 	// posicional e independente do estado do laço, e enfiá-la no meio da
 	// máquina de estados acrescentaria quatro ramos a um lugar onde cada ramo
 	// já custa caro para entender.
-	dv, dp := fencedInventory(dump)
-	inv.Vhosts = append(inv.Vhosts, dv...)
-	inv.Pools = append(inv.Pools, dp...)
+	attachFenced(&inv, dump)
 	return inv
 }
 
@@ -313,29 +322,89 @@ func BuildInventory(dump string) Inventory {
 // inteiro deixa a cerca de dentro ainda prefixada dentro do corpo da de fora.
 // `BuildInventory` sobre o corpo torna a chamar esta função, e cada nível
 // desprefixa o seu.
-func fencedInventory(dump string) ([]Vhost, []Pool) {
-	var vhosts []Vhost
-	var pools []Pool
-
+func attachFenced(inv *Inventory, dump string) {
 	for file, section := range sectionsByFile(dump) {
-		for _, f := range ScanFences(section) {
+		fences := ScanFences(section)
+		if len(fences) == 0 {
+			continue
+		}
+		// Os `server` que o nginx AINDA lê, em ordem de arquivo, e os índices
+		// dos vhosts correspondentes. As duas listas se alinham pelo mesmo
+		// argumento de `AttachRefs`: as duas varreduras percorrem o mesmo
+		// texto na mesma direção, e o que está cercado é invisível às duas.
+		var servers []Span
+		if spans, err := ScanBlocks(section); err == nil {
+			for _, sp := range FlattenSpans(spans) {
+				if sp.Kind == "server" {
+					servers = append(servers, sp)
+				}
+			}
+		}
+		var vidx []int
+		for i := range inv.Vhosts {
+			if inv.Vhosts[i].File == file && !inv.Vhosts[i].Disabled {
+				vidx = append(vidx, i)
+			}
+		}
+
+		for _, f := range fences {
 			// O corpo é reparseado como se fosse um arquivo, com o marcador
 			// na frente para que `File` saia preenchido — é o mesmo caminho
 			// que o dump de verdade percorre.
 			sub := BuildInventory("# configuration file " + file + ":\n" + f.Body + "\n")
-			for _, v := range sub.Vhosts {
-				v.Disabled, v.DisabledID = true, f.Meta.ID
-				v.DisabledAt, v.DisabledBy = f.Meta.At, f.Meta.By
-				vhosts = append(vhosts, v)
+			if len(sub.Vhosts) > 0 || len(sub.Pools) > 0 {
+				for _, v := range sub.Vhosts {
+					v.Disabled, v.DisabledID = true, f.Meta.ID
+					v.DisabledAt, v.DisabledBy = f.Meta.At, f.Meta.By
+					inv.Vhosts = append(inv.Vhosts, v)
+				}
+				for _, p := range sub.Pools {
+					p.Disabled, p.DisabledID = true, f.Meta.ID
+					p.DisabledAt, p.DisabledBy = f.Meta.At, f.Meta.By
+					inv.Pools = append(inv.Pools, p)
+				}
+				continue
 			}
-			for _, p := range sub.Pools {
-				p.Disabled, p.DisabledID = true, f.Meta.ID
-				p.DisabledAt, p.DisabledBy = f.Meta.At, f.Meta.By
-				pools = append(pools, p)
+
+			// Não declarou bloco de topo nenhum: é uma cerca DENTRO de um
+			// `server` — um location desligado. Ele tem de voltar para o vhost
+			// que o contém, senão some da tela; e sumir aqui é pior que no
+			// vhost, porque uma rota desligada não derruba o domínio, ela move
+			// o tráfego para o location mais genérico que casa.
+			locs := fencedLocations(f.Body)
+			if len(locs) == 0 {
+				continue
+			}
+			for i, sp := range servers {
+				if f.Start <= sp.Open || f.End >= sp.End {
+					continue
+				}
+				if i >= len(vidx) {
+					break
+				}
+				v := &inv.Vhosts[vidx[i]]
+				for _, l := range locs {
+					l.Disabled, l.DisabledID = true, f.Meta.ID
+					l.DisabledAt, l.DisabledBy = f.Meta.At, f.Meta.By
+					v.Locations = append(v.Locations, l)
+				}
+				break
 			}
 		}
 	}
-	return vhosts, pools
+}
+
+// fencedLocations lê as rotas de dentro de uma cerca.
+//
+// O corpo é embrulhado num `server` sintético porque o parser só reconhece
+// `location` dentro de um — reusar o parser de verdade é melhor que escrever
+// um segundo, que divergiria do primeiro na primeira diretiva nova.
+func fencedLocations(body string) []Location {
+	sub := BuildInventory("# configuration file _:\nserver {\n" + body + "\n}\n")
+	if len(sub.Vhosts) == 0 {
+		return nil
+	}
+	return sub.Vhosts[0].Locations
 }
 
 // sectionsByFile reparte o dump por arquivo de origem.
