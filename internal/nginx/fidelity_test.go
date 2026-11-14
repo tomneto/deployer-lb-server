@@ -385,3 +385,55 @@ func TestFidelityStillRefusesWhatTheTemplateCannotDo(t *testing.T) {
 		})
 	}
 }
+
+// O snippet de páginas de erro usa `alias`, que é uma diretiva BLOQUEADORA —
+// e mesmo assim ele não pode rebaixar o veredito de nenhum vhost.
+//
+// A razão é a forma do dump: `nginx -T` despeja cada arquivo sob seu próprio
+// marcador, em vez de inserir o conteúdo do include dentro do `server {}`. O
+// classificador só olha linhas depois de ver um `server {`, então o corpo do
+// snippet cai fora de qualquer vhost.
+//
+// Este teste existe porque a alternativa — HTML inline num `return` — foi
+// descartada justamente por não ser alcançável pela Cloudflare, e a troca por
+// arquivo só é segura enquanto esta propriedade valer. Se alguém passar a
+// expandir includes no dump, isto quebra aqui, e não em produção.
+func TestFidelityIgnoresTheErrorPagesSnippetFile(t *testing.T) {
+	const snippetFile = `# configuration file /etc/nginx/snippets/error-pages.conf:
+error_page 400 408 414 494 495 496 497  /_lb/errors/4xx.html;
+error_page 413                          /_lb/errors/413.html;
+error_page 500 502 503                  /_lb/errors/5xx.html;
+error_page 504                          /_lb/errors/504.html;
+
+location ^~ /_lb/errors/ {
+    alias /etc/nginx/lb-errors/;
+    add_header Cache-Control "public, max-age=300" always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+}
+`
+
+	dump := dumpWith(vhostSimples) + snippetFile
+	out := Fidelity(dump)
+
+	// O vhost é o único classificado: o arquivo do snippet não tem `server {`.
+	if len(out) != 1 {
+		t.Fatalf("esperava 1 vhost, veio %d: %+v", len(out), out)
+	}
+	v := out[0]
+	if v.Verdict != VerdictReproducible {
+		t.Fatalf("o snippet rebaixou o vhost para %s\nblockers=%+v\nlosses=%+v",
+			v.Verdict, v.Blockers, v.Losses)
+	}
+	// E nada dele vaza como achado — nem `alias`, nem `error_page`, nem as
+	// linhas que não dariam para tokenizar.
+	for _, finding := range append(append([]Finding{}, v.Blockers...), v.Losses...) {
+		switch finding.Directive {
+		case "alias", "error_page", "add_header":
+			t.Errorf("o conteúdo do snippet virou achado do vhost: %+v", finding)
+		}
+	}
+	if v.UnparsedLines != 0 {
+		t.Errorf("unparsed_lines = %d — o snippet entrou na contagem do vhost",
+			v.UnparsedLines)
+	}
+}

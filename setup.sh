@@ -77,6 +77,11 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 NGINX_MAIN_CONF="/etc/nginx/nginx.conf"
 NGINX_TEMPLATE_DIR="/etc/nginx/lb-templates"
 NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
+# As páginas de erro da borda. Ficam sob /etc/nginx, e não em /usr/share,
+# por duas razões concretas: o `restorecon` do ensure_selinux_compat já é
+# aplicado nessa árvore, e o unit do listener já declara
+# ReadWritePaths=/etc/nginx — então nada de novo precisa ser liberado.
+NGINX_ERRORS_DIR="/etc/nginx/lb-errors"
 NGINX_MIN_VERSION="1.18.0"
 # wireguard-tools versiona por data (ex.: v1.0.20210914) desde que o módulo
 # foi mainlined no kernel 5.6 (2020) — 1.0.20200513 é a primeira release
@@ -1124,12 +1129,15 @@ ensure_conf_dir_included() {
 }
 
 step4_config_lb() {
-    log "step 4/6: config (template, snippets, default_server catch-all)"
-    mkdir -p "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR" "$NGINX_CONF_DIR"
+    log "step 4/6: config (template, snippets, error pages, default_server catch-all)"
+    mkdir -p "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR" "$NGINX_CONF_DIR" "$NGINX_ERRORS_DIR"
 
     install -m 0644 "$REPO_ROOT/conf/nginx-app.conf.tmpl" "$NGINX_TEMPLATE_DIR/nginx-app.conf.tmpl"
     install -m 0644 "$REPO_ROOT/snippets/cloudflare-real-ip.conf" "$NGINX_SNIPPETS_DIR/cloudflare-real-ip.conf"
     install -m 0644 "$REPO_ROOT/snippets/error-pages.conf" "$NGINX_SNIPPETS_DIR/error-pages.conf"
+    # As páginas que o snippet acima serve. Incondicional, como os snippets:
+    # reprovisionar é o caminho de atualização delas.
+    install -m 0644 "$REPO_ROOT"/errors/*.html "$NGINX_ERRORS_DIR/"
 
     # D19: catch-all for hostnames the DNS already resolves but this LB
     # doesn't know about yet — without it nginx falls back to the first
@@ -1157,11 +1165,11 @@ EOF
     write_lb_env
     open_firewalld_port 80 tcp
     open_firewalld_port 443 tcp
-    ensure_selinux_compat /etc/nginx "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR"
+    ensure_selinux_compat /etc/nginx "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR" "$NGINX_ERRORS_DIR"
     install_swapctl
     install_ipctl
 
-    nginx -t || die "nginx -t failed after installing template/snippets/catch-all"
+    nginx -t || die "nginx -t failed after installing template/snippets/error-pages/catch-all"
 }
 
 step4_config_agent() {
