@@ -123,3 +123,37 @@ func TestReadConfTreeReportsAMissingMainFile(t *testing.T) {
 		t.Error("arquivo principal ausente devia ser erro")
 	}
 }
+
+func TestReadConfTreeSkipsDotfilesLikeNginxGlobDoes(t *testing.T) {
+	// Os backups deste listener são `.<nome>.bak-<ts>` ao lado do original. O
+	// `*` do Go casa nome com ponto; o do nginx não. Sem esta regra, cada
+	// edição acrescentava um vhost fantasma ao dump — um que o nginx nunca leu.
+	dir := t.TempDir()
+	confDir := filepath.Join(dir, "conf.d")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "nginx.conf")
+	if err := os.WriteFile(main, []byte("http {\n    include conf.d/*;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "real.conf"),
+		[]byte("server { server_name real.example.com; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, ".real.conf.bak-20260101-120000"),
+		[]byte("server { server_name fantasma.example.com; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := ReadConfTree(main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(tree, "real.example.com") {
+		t.Fatalf("o vhost de verdade sumiu do dump:\n%s", tree)
+	}
+	if contains(tree, "fantasma.example.com") {
+		t.Fatalf("o backup entrou no dump — o nginx nunca o leu:\n%s", tree)
+	}
+}

@@ -88,6 +88,16 @@ func appendConf(out *strings.Builder, path, prefix string, seen map[string]bool,
 		}
 		sort.Strings(matches)
 		for _, m := range matches {
+			// O `*` do filepath.Glob casa nome iniciado em ponto; o glob(3)
+			// que o nginx usa NÃO casa. A diferença importa porque os backups
+			// deste listener são `.<nome>.bak-<ts>`, gravados ao lado do
+			// original: num host com `include conf.d/*;` eles entrariam no
+			// dump a cada edição, e a tela passaria a mostrar vhosts
+			// duplicados que o nginx nunca leu — além de fazer o /v1/include
+			// recusar por colisão inexistente.
+			if strings.HasPrefix(filepath.Base(m), ".") {
+				continue
+			}
 			// A failed include is not fatal: nginx itself tolerates a glob
 			// that matches nothing, and one unreadable file must not cost the
 			// whole tree.

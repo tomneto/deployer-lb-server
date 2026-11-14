@@ -152,6 +152,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/app/", s.handleDeleteApp)
 	mux.HandleFunc("/v1/pool", s.handlePool)
 	mux.HandleFunc("/v1/include", s.handleInclude)
+	mux.HandleFunc("/v1/vhost", s.handleVhost)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
@@ -257,6 +258,10 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 
 	inv := nginx.BuildInventory(dump)
 	inv.ResolvePools()
+	// O endereço de cada bloco, para o painel poder dizer em QUAL mexer. Sem
+	// isto ele só teria o `server_name` — que não endereça nada, porque o
+	// padrão é dois blocos dividirem o mesmo nome (80 e 443).
+	inv.AttachRefs(dump)
 	s.probePools(inv.Pools)
 
 	// `files` é a lista COMPLETA do que foi carregado, não só o que declara
@@ -300,6 +305,14 @@ func (s *Server) handleDump(w http.ResponseWriter, r *http.Request) {
 func (s *Server) probePools(pools []nginx.Pool) {
 	var wg sync.WaitGroup
 	for i := range pools {
+		if pools[i].Disabled {
+			// Pool dentro de uma cerca: o nginx não o lê, então nada ali
+			// recebe tráfego. Sondar assim mesmo gastaria um dial por backend
+			// para medir o que já se sabe, e pintaria de vermelho um pool que
+			// alguém desligou de propósito — mesma razão do `srv.Down` logo
+			// abaixo.
+			continue
+		}
 		for j := range pools[i].Servers {
 			srv := &pools[i].Servers[j]
 			if srv.Host == "" || srv.Port == 0 {

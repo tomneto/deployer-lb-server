@@ -76,19 +76,15 @@ func httpBlockBody(conf string) (start, end int, ok bool) {
 	if loc == nil {
 		return 0, 0, false
 	}
-	depth := 0
-	for i := loc[1] - 1; i < len(conf); i++ {
-		switch conf[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return loc[1], i, true
-			}
-		}
+	// Via `MatchBrace`: aqui o risco é concreto, porque o bloco `http` de um LB
+	// escrito à mão contém os vhosts comentados à unha. Um `# }` esquecido
+	// fazia esta varredura achar o fim do `http` no lugar errado — e o fim do
+	// `http` é exatamente onde a linha de `include` é escrita.
+	end, err := MatchBrace(conf, loc[1]-1)
+	if err != nil {
+		return 0, 0, false
 	}
-	return 0, 0, false
+	return loc[1], end, true
 }
 
 // ConfDirIncluded diz se o nginx.conf já lê o diretório gerido.

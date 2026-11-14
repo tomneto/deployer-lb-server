@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -241,5 +242,56 @@ func TestPoolToggleFallsBackToTheStandardConfPath(t *testing.T) {
 	// de LEITURA — o que prova que ele tentou o caminho padrão.
 	if !strings.Contains(fmt.Sprint(body["error"]), "/etc/nginx/nginx.conf") {
 		t.Fatalf("esperava o default no erro, veio %v", body)
+	}
+}
+
+// Dois pools, duas requisições ao mesmo tempo, um arquivo só.
+const twoPoolConf = `events {}
+http {
+    upstream a_pool {
+        server 10.10.0.2:11000;
+    }
+    upstream b_pool {
+        server 10.10.0.3:11000;
+    }
+    server {
+        listen 80;
+        location / { proxy_pass http://a_pool; }
+    }
+}
+`
+
+func TestConcurrentPoolTogglesDoNotLoseAnUpdate(t *testing.T) {
+	// O mutex global serializava só o /v1/apply, então duas escritas no
+	// nginx.conf liam o MESMO texto e a última a gravar apagava a outra. Lost
+	// update silencioso, no arquivo que serve todo o tráfego.
+	runner := nginx.NewFakeRunner()
+	srv, _ := newTestServer(t, runner)
+	conf := filepath.Join(t.TempDir(), "nginx.conf")
+	if err := os.WriteFile(conf, []byte(twoPoolConf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv.cfg.MainConf = conf
+
+	var wg sync.WaitGroup
+	for i, pool := range []string{"a_pool", "b_pool"} {
+		wg.Add(1)
+		go func(i int, pool string) {
+			defer wg.Done()
+			doPool(t, srv, pool, true, fmt.Sprintf("nonce-concorrente-%d", i))
+		}(i, pool)
+	}
+	wg.Wait()
+
+	after, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(after)
+	if !strings.Contains(got, "server 10.10.0.2:11000 down;") {
+		t.Fatalf("a mudança em a_pool foi perdida:\n%s", got)
+	}
+	if !strings.Contains(got, "server 10.10.0.3:11000 down;") {
+		t.Fatalf("a mudança em b_pool foi perdida:\n%s", got)
 	}
 }

@@ -35,6 +35,16 @@ type Pool struct {
 	// three backends out is still serving, and showing it as disabled would
 	// be a lie.
 	Down bool `json:"down"`
+
+	// Mesmo papel que em Vhost: um upstream dentro de uma cerca. `Down` e
+	// `Disabled` são estados DIFERENTES e a tela não pode achatá-los — um
+	// pool `down` continua declarado e o nginx o lê; um pool desligado não
+	// existe para o nginx, e um `proxy_pass` que ainda aponte para ele faz o
+	// reload falhar.
+	Disabled   bool   `json:"disabled,omitempty"`
+	DisabledID string `json:"disabled_id,omitempty"`
+	DisabledAt string `json:"disabled_at,omitempty"`
+	DisabledBy string `json:"disabled_by,omitempty"`
 }
 
 type PoolServer struct {
@@ -63,6 +73,25 @@ type Vhost struct {
 	Managed     bool       `json:"managed"`
 	App         string     `json:"app,omitempty"`
 	Locations   []Location `json:"locations"`
+
+	// Disabled e companhia descrevem um bloco que está DENTRO de uma cerca —
+	// comentado, portanto invisível ao nginx, e visível só aqui.
+	//
+	// Precisam existir porque este parser descarta comentário: sem eles, o
+	// vhost desligado some da tela, e o que some da tela não tem como ser
+	// religado. Um bloco desligado continua listado, na mesma posição (ordem
+	// de arquivo é ordem de resolução do nginx), com a procedência que a cerca
+	// guarda. `DisabledBy` é ALEGADO, nunca verificado — o HMAC autentica o
+	// painel, não a pessoa, e a tela precisa dizer isso.
+	Disabled   bool   `json:"disabled,omitempty"`
+	DisabledID string `json:"disabled_id,omitempty"`
+	DisabledAt string `json:"disabled_at,omitempty"`
+	DisabledBy string `json:"disabled_by,omitempty"`
+
+	// Ref é o endereço deste bloco, opaco: o painel o devolve verbatim para
+	// dizer em QUAL bloco mexer. Vazio num vhost desligado, que é endereçado
+	// pelo id da cerca (`DisabledID`) e não por conteúdo.
+	Ref string `json:"ref,omitempty"`
 }
 
 // Location is one `location` block inside a vhost.
@@ -96,6 +125,12 @@ var (
 	invBackendRe  = regexp.MustCompile(`^server\s+([^\s;]+?):(\d+)\s*([^;]*);`)
 	invUpgradeRe  = regexp.MustCompile(`(?i)^proxy_set_header\s+Upgrade\s`)
 	invSchemeRe   = regexp.MustCompile(`^https?://([^/;]+)`)
+
+	// A mesma pergunta que `fileMarkerRe`, mas sobre o dump INTEIRO em vez de
+	// uma linha. A original é ancorada à string toda porque é aplicada linha a
+	// linha; reusá-la aqui não casaria nada, e trocar a dela por multilinha
+	// mudaria o comportamento de todos os outros chamadores.
+	fileMarkerLineRe = regexp.MustCompile(`(?m)^# configuration file (.+):[ \t]*\r?$`)
 )
 
 // applyLocationLine extrai de uma linha o que interessa dentro de um
@@ -257,7 +292,76 @@ func BuildInventory(dump string) Inventory {
 			vhost, depth = nil, 0
 		}
 	}
+
+	// E, por último, o que o laço acima JAMAIS veria: os blocos que estão
+	// dentro de uma cerca. Ele descarta toda linha iniciada por `#`, que é
+	// justamente o que um bloco desligado é.
+	//
+	// Vem depois, e não no meio do laço, de propósito: a varredura de cercas é
+	// posicional e independente do estado do laço, e enfiá-la no meio da
+	// máquina de estados acrescentaria quatro ramos a um lugar onde cada ramo
+	// já custa caro para entender.
+	dv, dp := fencedInventory(dump)
+	inv.Vhosts = append(inv.Vhosts, dv...)
+	inv.Pools = append(inv.Pools, dp...)
 	return inv
+}
+
+// fencedInventory lê o que está desligado, recursivamente.
+//
+// Recursivo porque cercas aninham: desligar um location e depois o server
+// inteiro deixa a cerca de dentro ainda prefixada dentro do corpo da de fora.
+// `BuildInventory` sobre o corpo torna a chamar esta função, e cada nível
+// desprefixa o seu.
+func fencedInventory(dump string) ([]Vhost, []Pool) {
+	var vhosts []Vhost
+	var pools []Pool
+
+	for file, section := range sectionsByFile(dump) {
+		for _, f := range ScanFences(section) {
+			// O corpo é reparseado como se fosse um arquivo, com o marcador
+			// na frente para que `File` saia preenchido — é o mesmo caminho
+			// que o dump de verdade percorre.
+			sub := BuildInventory("# configuration file " + file + ":\n" + f.Body + "\n")
+			for _, v := range sub.Vhosts {
+				v.Disabled, v.DisabledID = true, f.Meta.ID
+				v.DisabledAt, v.DisabledBy = f.Meta.At, f.Meta.By
+				vhosts = append(vhosts, v)
+			}
+			for _, p := range sub.Pools {
+				p.Disabled, p.DisabledID = true, f.Meta.ID
+				p.DisabledAt, p.DisabledBy = f.Meta.At, f.Meta.By
+				pools = append(pools, p)
+			}
+		}
+	}
+	return vhosts, pools
+}
+
+// sectionsByFile reparte o dump por arquivo de origem.
+//
+// Um dump sem marcador nenhum (o corpo de uma cerca sendo reparseado, por
+// exemplo) conta como uma seção só, de arquivo desconhecido — devolver nada
+// aqui faria o aninhamento parar no segundo nível.
+func sectionsByFile(dump string) map[string]string {
+	out := map[string]string{}
+	marks := fileMarkerLineRe.FindAllStringSubmatchIndex(dump, -1)
+	if len(marks) == 0 {
+		out[""] = dump
+		return out
+	}
+	if first := marks[0][0]; first > 0 {
+		out[""] = dump[:first]
+	}
+	for i, m := range marks {
+		end := len(dump)
+		if i+1 < len(marks) {
+			end = marks[i+1][0]
+		}
+		file := dump[m[2]:m[3]]
+		out[file] += dump[m[1]:end]
+	}
+	return out
 }
 
 // ResolvePools marks which pool each location points at, so the panel can link
@@ -267,6 +371,13 @@ func BuildInventory(dump string) Inventory {
 func (inv *Inventory) ResolvePools() {
 	known := map[string]bool{}
 	for _, p := range inv.Pools {
+		// Pool desligado não é pool conhecido: para o nginx ele não existe, e
+		// um location que aponte para ele não tem backend nenhum — tem um
+		// reload que vai falhar. Marcá-lo como resolvido mostraria backends
+		// saudáveis para uma rota que está quebrada.
+		if p.Disabled {
+			continue
+		}
 		known[p.Name] = true
 	}
 	for vi := range inv.Vhosts {

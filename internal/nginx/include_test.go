@@ -118,3 +118,38 @@ func TestEnsureConfDirIncludeKeepsTheClosingBraceIndentation(t *testing.T) {
 		t.Fatalf("o comentário de autoria tem de ficar junto da linha:\n%s", res.Config)
 	}
 }
+
+func TestEnsureConfDirIncludeSurvivesUnbalancedBraceInComment(t *testing.T) {
+	// O vhost comentado à unha é o estado normal de um LB escrito à mão — e um
+	// `# }` esquecido deixa as chaves comentadas desbalanceadas. A contagem
+	// ingênua achava o fim do bloco `http` cedo demais, e o fim do `http` é
+	// exatamente onde esta função escreve. A linha ia parar no meio do arquivo.
+	conf := `http {
+    # server {
+    #     listen 80;
+    # o fechamento deste comentario foi apagado por alguem
+
+    server {
+        listen 80;
+        server_name real.example.com;
+    }
+}
+`
+	res, err := EnsureConfDirInclude(conf, "/etc/nginx/conf.d", "/etc/nginx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Changed {
+		t.Fatal("a linha de include precisava ter sido acrescentada")
+	}
+	// A prova: o include tem de cair DEPOIS do vhost real, no fim do `http`,
+	// e não espremido entre o comentario e o server.
+	at := indexOf(res.Config, "include /etc/nginx/conf.d/*.conf;")
+	srv := indexOf(res.Config, "server_name real.example.com;")
+	if at < 0 {
+		t.Fatalf("include nao foi escrito:\n%s", res.Config)
+	}
+	if at < srv {
+		t.Fatalf("o include caiu ANTES do vhost real — a chave comentada moveu o fim do http:\n%s", res.Config)
+	}
+}

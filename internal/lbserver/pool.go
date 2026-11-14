@@ -105,6 +105,13 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 		mainConf = "/etc/nginx/nginx.conf"
 	}
 
+	// Ler-modificar-escrever precisa ser atômico, e não era: o mutex global
+	// serializava só o /v1/apply, então dois POST /v1/pool concorrentes liam o
+	// mesmo `original` e o segundo a escrever apagava a mudança do primeiro.
+	// Lost update silencioso no arquivo que serve todo o tráfego.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	original, err := os.ReadFile(mainConf)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -141,7 +148,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	restore := func(reason string, code int) {
-		_ = os.WriteFile(mainConf, original, mode)
+		_ = nginx.WriteAtomic(mainConf, original, mode)
 		reloadOut, reloadErr := s.cfg.Runner.Reload()
 		payload := map[string]any{
 			"status": "error", "error": reason, "restored": true, "backup": backup,
@@ -156,7 +163,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, payload)
 	}
 
-	if err := os.WriteFile(mainConf, []byte(res.Config), mode); err != nil {
+	if err := nginx.WriteAtomic(mainConf, []byte(res.Config), mode); err != nil {
 		_ = os.Remove(backup)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status": "error", "error": "cannot write config: " + err.Error()})

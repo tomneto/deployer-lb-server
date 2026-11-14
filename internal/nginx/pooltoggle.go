@@ -86,25 +86,13 @@ func SetPoolDown(conf, pool string, down bool) (PoolToggleResult, error) {
 		return res, fmt.Errorf("upstream %q not found", pool)
 	}
 
-	// Walk braces from the block's opening one so a nested block (a `keepalive`
-	// zone, a commented brace) cannot end the scan early.
-	depth := 0
-	end := -1
-	for i := loc[1] - 1; i < len(conf); i++ {
-		switch conf[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				end = i
-			}
-		}
-		if end >= 0 {
-			break
-		}
-	}
-	if end < 0 {
+	// A fronteira do bloco vem de `MatchBrace` — a única resposta do pacote
+	// para essa pergunta. A contagem byte a byte que vivia aqui PROMETIA, no
+	// próprio comentário, ignorar "a commented brace", e não ignorava: contava
+	// chave dentro de comentário e de string, e por isso discordava do
+	// inventário em qualquer arquivo que tivesse uma.
+	end, err := MatchBrace(conf, loc[1]-1)
+	if err != nil {
 		return res, fmt.Errorf("upstream %q is not closed", pool)
 	}
 
