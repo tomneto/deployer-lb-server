@@ -35,8 +35,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"fmt"
+	"path/filepath"
 )
 
 var (

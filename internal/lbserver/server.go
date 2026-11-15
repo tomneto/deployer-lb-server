@@ -177,6 +177,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/include", s.handleInclude)
 	mux.HandleFunc("/v1/vhost", s.handleVhost)
 	mux.HandleFunc("/v1/location", s.handleLocation)
+	mux.HandleFunc("/v1/pool/servers", s.handlePoolServers)
 	// A mesma rota serve leitura e escrita, separadas por método: é um
 	// recurso só — o arquivo — e dois caminhos diferentes para ele dariam a
 	// impressão de serem coisas distintas.
