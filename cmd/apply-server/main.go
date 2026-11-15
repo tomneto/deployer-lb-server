@@ -43,10 +43,19 @@ func main() {
 		templatePath = flag.String("template", envOr("NGINX_TEMPLATE_PATH", ""), "override: path to an nginx-app.conf.tmpl on disk (default: the template compiled into this binary)")
 		mainConf     = flag.String("main-conf", envOr("NGINX_MAIN_CONF", "/etc/nginx/nginx.conf"), "the host's main nginx.conf — read for /v1/dump's fallback, and written by /v1/pool")
 		maxBodyBytes = flag.Int64("max-body-bytes", 64*1024, "max accepted request body size in bytes")
-		tsWindow     = flag.Duration("ts-window", 30*time.Second, "allowed clock skew for X-Payload-Ts")
-		nonceTTL     = flag.Duration("nonce-ttl", 5*time.Minute, "how long nonces are remembered for replay protection")
-		showVerS     = flag.Bool("v", false, "print version and exit")
-		showVerL     = flag.Bool("version", false, "print version and exit")
+		// Desligada por padrão, e deliberadamente: escrever texto cru num
+		// arquivo de nginx é controle equivalente a root do processo nginx —
+		// dá para trocar o `user`, acrescentar `load_module`, incluir
+		// qualquer diretório. Filtrar diretiva a diretiva é jogo perdido, e
+		// por isso o controle é de capacidade: quem liga isto sabe o que
+		// está liberando. As outras rotas de escrita não precisam dela,
+		// porque o que elas fazem é fechado.
+		allowRawEdit    = flag.Bool("allow-raw-edit", envOr("LB_ALLOW_RAW_EDIT", "") == "1", "allow POST /v1/file to write arbitrary config text (root-equivalent over nginx; off by default)")
+		maxRawBodyBytes = flag.Int64("max-raw-body-bytes", 4*1024*1024, "max accepted body size for POST /v1/file — a real nginx.conf plus JSON escaping blows past the general 64KB limit")
+		tsWindow        = flag.Duration("ts-window", 30*time.Second, "allowed clock skew for X-Payload-Ts")
+		nonceTTL        = flag.Duration("nonce-ttl", 5*time.Minute, "how long nonces are remembered for replay protection")
+		showVerS        = flag.Bool("v", false, "print version and exit")
+		showVerL        = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -64,16 +73,18 @@ func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
 	srv := lbserver.New(lbserver.Config{
-		Token:        *token,
-		Secret:       *secret,
-		ConfDir:      *confDir,
-		TemplatePath: *templatePath,
-		MainConf:     *mainConf,
-		MaxBodyBytes: *maxBodyBytes,
-		TSWindow:     *tsWindow,
-		NonceTTL:     *nonceTTL,
-		Runner:       nginx.RealRunner{},
-		Logger:       logger,
+		Token:           *token,
+		Secret:          *secret,
+		ConfDir:         *confDir,
+		TemplatePath:    *templatePath,
+		MainConf:        *mainConf,
+		MaxBodyBytes:    *maxBodyBytes,
+		AllowRawEdit:    *allowRawEdit,
+		MaxRawBodyBytes: *maxRawBodyBytes,
+		TSWindow:        *tsWindow,
+		NonceTTL:        *nonceTTL,
+		Runner:          nginx.RealRunner{},
+		Logger:          logger,
 	})
 
 	// Antes de aceitar o primeiro apply: o template que este binário usaria

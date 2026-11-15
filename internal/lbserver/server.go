@@ -47,6 +47,26 @@ type Config struct {
 	Now          func() time.Time // injectable clock; defaults to time.Now
 	Logger       *log.Logger      // structured, append-only apply log (§2.3)
 
+	// AllowRawEdit libera a escrita de texto CRU num arquivo de config.
+	//
+	// Nasce desligada, e não por excesso de zelo: escrever um arquivo de
+	// nginx arbitrário é controle equivalente a root do processo nginx — dá
+	// para trocar o `user`, acrescentar `load_module`, incluir qualquer
+	// diretório. Tentar filtrar diretiva a diretiva é jogo perdido (a lista
+	// de o-que-é-perigoso nunca fica pronta), então o controle é de
+	// CAPACIDADE: quem liga isto num host sabe o que está liberando.
+	//
+	// As outras rotas de escrita não precisam dela porque o que elas fazem é
+	// fechado: comentar um bloco que já estava no arquivo, ou mexer em
+	// parâmetro de upstream dentro de um bloco que já existe.
+	AllowRawEdit bool
+	// MaxRawBodyBytes é o limite SÓ da rota de arquivo cru.
+	//
+	// O limite geral é 64KB, pensado para o payload de um apply. Um
+	// `nginx.conf` de verdade mais o escape de JSON passa disso com folga, e
+	// a rota nasceria quebrada justamente no arquivo que mais importa.
+	MaxRawBodyBytes int64
+
 	// Upstream health probing for GET /v1/status (C6): a plain TCP dial per
 	// upstream, cached so repeated status polls stay cheap.
 	HealthDialTimeout time.Duration                                                       // per-dial timeout; defaults to 1s
@@ -66,6 +86,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxQueueLen <= 0 {
 		c.MaxQueueLen = 64
+	}
+	if c.MaxRawBodyBytes <= 0 {
+		c.MaxRawBodyBytes = 4 * 1024 * 1024
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -154,6 +177,16 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/include", s.handleInclude)
 	mux.HandleFunc("/v1/vhost", s.handleVhost)
 	mux.HandleFunc("/v1/location", s.handleLocation)
+	// A mesma rota serve leitura e escrita, separadas por método: é um
+	// recurso só — o arquivo — e dois caminhos diferentes para ele dariam a
+	// impressão de serem coisas distintas.
+	mux.HandleFunc("/v1/file", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.handleFileRead(w, r)
+			return
+		}
+		s.handleFileWrite(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
