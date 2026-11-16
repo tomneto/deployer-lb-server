@@ -32,6 +32,16 @@ dependencies, WireGuard, the binary itself, config, and the systemd unit.
   payload at boot and refuses to start if it fails, so a bad override halts the
   fleet's canary instead of poisoning applies one pipeline at a time.
 
+  Até v0.6.4 essa frase era só metade verdadeira: `write_lb_env` escrevia
+  `NGINX_TEMPLATE_PATH=/etc/nginx/lb-templates/nginx-app.conf.tmpl` no
+  `lb.env`, ou seja, deixava o override LIGADO em todo host provisionado — e o
+  template vinha do checkout enquanto o binário vinha de `releases/latest`.
+  Foi assim que `{{if $.Streaming.Enabled}}`, novo no template, encontrou um
+  binário v0.6.4 sem o campo: `VerifyTemplate()` é `log.Fatal` e roda ANTES do
+  bind, então o listener morria no boot e a central via `dial tcp
+  10.10.0.1:8443: connect: connection refused` — sem 404, sem apply falho, sem
+  pista. O `lb.env` agora nasce com a variável vazia.
+
 - Managed vhosts can declare several `location` blocks (`locations` in the
   apply payload, schema_version 2): `=`, `^~`, `~`, `~*` and prefix matchers,
   plus `proxy_pass` to an external destination. Validation is a strict
@@ -145,6 +155,18 @@ bash scripts/test-ipctl.sh
 
 No root, no nftables, no container. What it deliberately does not cover is
 whether the kernel accepts the ruleset — that is tier 2.
+
+E um terceiro, para os guardas que separam "o `setup.sh lb` terminou" de "a
+porta de controle responde" — `NGINX_TEMPLATE_PATH` vazio no `lb.env`, o
+`--port` que não pode ser público, e o health check do step 6 que agora reprova
+quando a unit não está nem subindo:
+
+```
+bash scripts/test-lb-listener-guards.sh
+```
+
+Também sem docker e sem systemd: extrai as funções reais do `setup.sh` e as
+exercita contra stubs de `systemctl`/`curl`/`journalctl`.
 
 No Docker, no network — extracts the real function out of `setup.sh` and
 exercises it against a throwaway local git repo + fake binaries.

@@ -13,7 +13,8 @@
 #                        [--intake-url <url> --agent-token <token> --interval 8]
 #   bash setup.sh agent --intake-url <url> --agent-token <token> \
 #                        --interval 8 --wg-ip <wireguard_ip> \
-#                        --wg-hub <pubkey:endpoint,...>
+#                        --wg-hub <pubkey:endpoint,...> \
+#                        [--net-name <slug>] [--net-hosts <name:ip,...>]
 #
 # Both modes also accept --with-crowdsec (install CrowdSec + the nftables
 # firewall bouncer, standalone LAPI on this host) and --security-interval
@@ -76,6 +77,10 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 # que o nginx nunca lê.
 NGINX_MAIN_CONF="/etc/nginx/nginx.conf"
 NGINX_TEMPLATE_DIR="/etc/nginx/lb-templates"
+# O template que o listener USA é o compilado dentro do binário (conf/embed.go).
+# Esta variável é um OVERRIDE deliberado, e por isso nasce VAZIA: só quem está
+# testando um template diferente a preenche, pelo ambiente.
+NGINX_TEMPLATE_PATH="${NGINX_TEMPLATE_PATH:-}"
 NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
 # As páginas de erro da borda. Ficam sob /etc/nginx, e não em /usr/share,
 # por duas razões concretas: o `restorecon` do ensure_selinux_compat já é
@@ -142,6 +147,10 @@ AGENT_SECURITY_INTERVAL="${AGENT_SECURITY_INTERVAL:-60s}"
 
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
+# Onde mora o lb.env que o unit lê. Variável, e não literal, pelo mesmo motivo
+# de SYSTEMD_DIR: é o que deixa scripts/test-lb-listener-guards.sh exercitar a
+# função de verdade contra um diretório descartável, em vez de reescrevê-la.
+LB_ENV_DIR="${LB_ENV_DIR:-/etc/deployer-lb-server}"
 
 log()  { printf '[setup.sh][%s] %s\n' "$MODE" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
@@ -154,6 +163,19 @@ mem_snapshot() {
     awk '/^MemTotal:/{t=$2} /^SwapTotal:/{s=$2} /^MemAvailable:/{a=$2}
          END{printf "RAM=%dMB swap=%dMB avail=%dMB", t/1024, s/1024, a/1024}' \
         /proc/meminfo
+}
+
+# O estado de uma unit que não subiu, em texto, para ir junto do `die`.
+#
+# Existe porque "systemctl falhou" sozinho não diz nada a quem lê o log de
+# provisionamento na central: a causa real (token vazio, template que não
+# executa, bind num IP que ainda não existe) só aparece no journal da unit.
+unit_failure_context() {
+    local unit="$1"
+    printf '\n    --- systemctl status %s ---\n' "$unit"
+    systemctl status --no-pager --lines=0 "$unit" 2>&1 | sed 's/^/    /' || true
+    printf '    --- journalctl -u %s -n 20 ---\n' "$unit"
+    journalctl -u "$unit" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
 }
 
 RAM_TOTAL_MB=0
@@ -222,6 +244,12 @@ while [[ $# -gt 0 ]]; do
         --wg-iface) WG_IFACE="$2"; shift 2 ;;
         --wg-peers) WG_PEERS="$2"; shift 2 ;;
         --wg-hub) WG_HUB="$2"; shift 2 ;;
+        # O nome canônico DESTA máquina na malha, e o mapa da malha inteira.
+        # Ambos OPCIONAIS: sem --net-name o passo é pulado por inteiro e o
+        # script se comporta exatamente como antes, que é o que mantém uma
+        # central antiga funcionando contra um setup.sh novo.
+        --net-name) NET_NAME="$2"; shift 2 ;;
+        --net-hosts) NET_HOSTS="$2"; shift 2 ;;
         --iptables-bootstrap) IPTABLES_BOOTSTRAP_SCRIPT="$2"; shift 2 ;;
         --skip-docker) SKIP_DOCKER=1; shift ;;
         --with-docker) WITH_DOCKER=1; shift ;;
@@ -236,10 +264,12 @@ done
 (( SKIP_CROWDSEC && WITH_CROWDSEC )) && die "--skip-crowdsec and --with-crowdsec are mutually exclusive"
 
 if [[ "$MODE" == "lb" ]]; then
+    validate_net_name
     [[ -n "$WG_IP" ]] || die "--wg-ip is required for mode lb"
 elif [[ "$MODE" == "agent" ]]; then
     [[ -n "$INTAKE_URL" ]] || die "--intake-url is required for mode agent"
     [[ -n "$AGENT_TOKEN" ]] || die "--agent-token is required for mode agent"
+    validate_net_name
     [[ -n "$WG_IP" ]] || die "--wg-ip is required for mode agent"
 fi
 
@@ -831,6 +861,105 @@ ensure_wg_keypair() {
     log "WireGuard public key: $WG_PUBKEY (send this back to the central for peering)"
 }
 
+# ── nomes da malha em /etc/hosts ───────────────────────────────────────
+#
+# Por que não DNS: um resolvedor viveria dentro da própria malha, de modo que
+# a malha instável derrubaria a resolução que deveria ajudar a diagnosticá-la.
+# Um arquivo local já está na máquina quando o túnel cai.
+#
+# ATENÇÃO: nome NÃO serve para --wg-peers nem para --wg-hub. O `wg-quick`
+# resolve `Endpoint` por getaddrinfo, isto é, LÊ este mesmo /etc/hosts — um
+# nome .wg ali seria ovo-e-galinha, porque ele só resolve depois que o bloco
+# existe, e o bloco é escrito depois que o túnel sobe. Aqueles dois
+# continuam estritamente IP e endpoint público.
+
+# Espelho de ValidateNetName (targets/netname.go) e de netNameErrors
+# (netNameModel.js). As três pontas têm de recusar o mesmo conjunto.
+validate_net_name() {
+    [[ -n "${NET_NAME:-}" ]] || return 0
+    [[ "$NET_NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+        || die "--net-name '$NET_NAME' não é um rótulo DNS: só letras minúsculas, dígitos e hífen, sem começar nem terminar com hífen"
+}
+
+# Regenera o bloco inteiro; NUNCA anexa.
+#
+# Três propriedades carregam peso, e cada uma é um jeito de inutilizar a
+# máquina se feita de qualquer jeito:
+#   1. escreve num temporário e `cp` por cima, em vez de redirecionar para
+#      /etc/hosts — um redirect que morre no meio deixa o host sem a linha de
+#      localhost, e aí nada mais nele funciona;
+#   2. recusa marcadores desbalanceados em vez de consertar no escuro: meio
+#      bloco editado à mão significa que alguém esteve ali, e adivinhar o que
+#      a pessoa queria é como uma ferramenta perde o direito de tocar no
+#      arquivo;
+#   3. nunca encosta em linha fora dos marcadores.
+write_mesh_hosts() {
+    local begin="# BEGIN workspacefy-mesh"
+    local end="# END workspacefy-mesh"
+    local tmp out b e
+
+    b=$(grep -cF "$begin" /etc/hosts 2>/dev/null || true)
+    e=$(grep -cF "$end" /etc/hosts 2>/dev/null || true)
+    if [[ "$b" != "$e" || "$b" -gt 1 ]]; then
+        log "warning: /etc/hosts tem marcadores workspacefy-mesh desbalanceados — não vou tocar nele"
+        return 0
+    fi
+
+    # Avisa, mas NÃO remove: linha escrita à mão não é nossa. Uma entrada .wg
+    # fora do bloco vence a nossa (o primeiro match em /etc/hosts ganha), e o
+    # sintoma disso — metade da frota falando com a máquina errada — não tem
+    # como ser diagnosticado a partir do nosso lado.
+    if awk -v b="$begin" -v e="$end" \
+        'BEGIN{skip=0;found=0} $0==b{skip=1;next} $0==e{skip=0;next} skip==1{next} /[ \t][-a-z0-9]+\.wg([ \t]|$)/{found=1} END{exit !found}' \
+        /etc/hosts 2>/dev/null; then
+        log "warning: há entrada .wg escrita à mão FORA do bloco gerenciado em /etc/hosts — ela vence a nossa e pode apontar para a máquina errada"
+    fi
+
+    tmp=$(mktemp); out=$(mktemp)
+    {
+        echo "$begin"
+        echo "# gerado pelo deployer-lb-server — edições aqui dentro são perdidas"
+        # A própria máquina, sempre — mesmo sem --net-hosts.
+        [[ -n "${NET_NAME:-}" && -n "${WG_IP:-}" ]] && echo "$WG_IP ${NET_NAME}.wg ${NET_NAME}"
+        # O resto da malha, ordenado para que duas gerações do mesmo conjunto
+        # sejam byte a byte iguais — é o que permite a este script e ao
+        # backend convergirem no mesmo arquivo em vez de brigarem.
+        if [[ -n "${NET_HOSTS:-}" ]]; then
+            while IFS=: read -r name ip; do
+                [[ -n "$name" && -n "$ip" ]] || continue
+                [[ "$name" == "${NET_NAME:-}" ]] && continue
+                echo "$ip ${name}.wg ${name}"
+            done < <(parse_peer_list "$NET_HOSTS" | sort)
+        fi
+        echo "$end"
+    } > "$tmp"
+
+    awk -v b="$begin" -v e="$end" 'BEGIN{skip=0} $0==b{skip=1;next} $0==e{skip=0;next} skip==0{print}' /etc/hosts > "$out"
+    cat "$tmp" >> "$out"
+
+    # Nunca instalar um /etc/hosts sem a linha de localhost.
+    if ! grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]' "$out"; then
+        log "warning: o /etc/hosts resultante não teria a linha de 127.0.0.1 — abortando a escrita"
+        rm -f "$tmp" "$out"
+        return 0
+    fi
+
+    cp "$out" /etc/hosts
+    rm -f "$tmp" "$out"
+    log "mesh names published in /etc/hosts (${NET_NAME}.wg)"
+}
+
+# Chamado de main(), FORA dos step2_wireguard_*.
+#
+# Aquelas duas retornam cedo quando a interface já existe ("validating only"),
+# e escrever o bloco lá dentro significaria que toda máquina já provisionada
+# — isto é, o parque instalado inteiro — nunca receberia nome nenhum.
+step2b_mesh_names() {
+    [[ -n "${NET_NAME:-}" ]] || return 0
+    log "step2b: publishing mesh names in /etc/hosts"
+    write_mesh_hosts
+}
+
 wg_iface_configured() {
     ip link show "$WG_IFACE" >/dev/null 2>&1
 }
@@ -1007,11 +1136,60 @@ step3_binary_agent() {
 # Step 4 — Config
 # ---------------------------------------------------------------------------
 
+# A porta de controle do LB não pode nascer num IP público.
+#
+# `/v1/apply` e as outras rotas de escrita são controle equivalente a root
+# sobre o nginx deste host, atrás de bearer + HMAC. O caminho previsto é o
+# WireGuard; loopback também serve (o alvo que é a própria central). Qualquer
+# outro endereço significa que quem montou o `--port` resolveu o host pela
+# precedência genérica (wireguard-first, public-IP-fallback) num alvo sem IP
+# de WireGuard — e o fallback, que existe para o primeiro SSH do bootstrap,
+# acabou escolhendo a interface pública.
+#
+# É validação de argumento, antes de escrever a config: não abre nem fecha
+# firewall nenhum.
+assert_lb_port_not_public() {
+    local host="${LB_PORT%:*}"
+
+    case "$host" in
+        127.0.0.1|localhost|::1|'[::1]') return 0 ;;
+    esac
+
+    if [[ -z "$WG_IP" ]]; then
+        die "--port $LB_PORT binds the LB control port to '$host', and no --wg-ip was given to compare it against — the control port only ever listens on loopback or the WireGuard address"
+    fi
+
+    # Mesmo /24 do endereço de WireGuard deste host. A sub-rede do overlay é
+    # /24 por padrão (DEPLOY_WG_SUBNET=10.10.0.0/24 na central).
+    local wg_net="${WG_IP%.*}" host_net="${host%.*}"
+    if [[ "$host_net" != "$wg_net" ]]; then
+        die "--port $LB_PORT binds the LB control port to '$host', which is outside the WireGuard network ${wg_net}.0/24 — the control port is never exposed on a public address"
+    fi
+}
+
 # The env file deployer-lb-server.service reads (EnvironmentFile=-/etc/
 # deployer-lb-server/lb.env) for --addr/--conf-dir/--template/--token/
 # --secret — mirrors write_agent_env() below. Without this the unit starts
 # with all flags empty (pre-existing gap, unrelated to distro — fixed here
 # because step4_config_lb is already the step that owns these paths).
+#
+# NGINX_TEMPLATE_PATH sai VAZIO de propósito, e isto não é descuido: é a
+# diferença entre um listener que sobe e um que morre no boot.
+#
+# Este arquivo fixava o caminho do template em disco, o que deixava o override
+# SEMPRE ligado — e template e binário chegam ao host por caminhos diferentes.
+# O template vem do checkout (step4_config_lb o instala em $NGINX_TEMPLATE_DIR);
+# o binário vem, no degrau normal, do asset de `releases/latest`. Um template de
+# `main` com um binário da release anterior é exatamente a skew que `conf/embed.go`
+# existe para impedir: `text/template` não tolera campo que o binário não tem,
+# `VerifyTemplate()` roda ANTES do bind e é `log.Fatal`, e o resultado na central
+# é `connection refused` na 8443 — sem 404, sem erro de apply, sem pista.
+#
+# Foi assim que `{{if $.Streaming.Enabled}}` (novo no template) encontrou um
+# binário v0.6.4 (sem o campo) e derrubou o LB de produção inteiro.
+#
+# A cópia em $NGINX_TEMPLATE_DIR continua sendo instalada: ela é documentação
+# para quem lê o host, não a fonte.
 #
 # --lb-token/--lb-secret are optional on this script: cmd/apply-server
 # requires them to even start (LB_TOKEN/LB_SHARED_SECRET), but the caller
@@ -1019,20 +1197,20 @@ step3_binary_agent() {
 # it gets, empty or not, and warns loudly when they're missing rather than
 # silently leaving the LB unable to boot.
 write_lb_env() {
-    mkdir -p /etc/deployer-lb-server
+    mkdir -p "$LB_ENV_DIR"
     # Em subshell: o `umask` restrito vale para este arquivo e não contamina o
     # resto do script (ver o comentário em ensure_wg_keypair).
     ( umask 077
-    cat > /etc/deployer-lb-server/lb.env <<EOF
+    cat > "$LB_ENV_DIR/lb.env" <<EOF
 LB_LISTEN_ADDR=${LB_PORT}
 NGINX_CONF_DIR=${NGINX_CONF_DIR}
-NGINX_TEMPLATE_PATH=${NGINX_TEMPLATE_DIR}/nginx-app.conf.tmpl
+NGINX_TEMPLATE_PATH=${NGINX_TEMPLATE_PATH}
 LB_TOKEN=${LB_TOKEN}
 LB_SHARED_SECRET=${LB_SECRET}
 EOF
     )
-    chmod 600 /etc/deployer-lb-server/lb.env
-    log "wrote /etc/deployer-lb-server/lb.env"
+    chmod 600 "$LB_ENV_DIR/lb.env"
+    log "wrote $LB_ENV_DIR/lb.env"
     if [[ -z "$LB_TOKEN" || -z "$LB_SECRET" ]]; then
         log "warning: --lb-token/--lb-secret not provided — deployer-lb-server will refuse to start (LB_TOKEN/LB_SHARED_SECRET required) until lb.env is filled in"
     fi
@@ -1162,6 +1340,7 @@ EOF
     # incluir".
     ensure_conf_dir_included
 
+    assert_lb_port_not_public
     write_lb_env
     open_firewalld_port 80 tcp
     open_firewalld_port 443 tcp
@@ -1264,10 +1443,16 @@ step5_systemd_lb() {
         return 0
     fi
     systemctl daemon-reload
-    systemctl enable --now deployer-lb-server.service
+    # O exit code destes dois importa: sem conferi-lo o script seguia para o
+    # step 6, que só avisava, e o provisionamento terminava VERDE com a porta
+    # de controle morta. Um `die` aqui é o que faz o LB quebrado aparecer na
+    # central como falha, e não como "atualizado".
+    systemctl enable --now deployer-lb-server.service \
+        || die "systemctl enable --now deployer-lb-server.service failed$(unit_failure_context deployer-lb-server.service)"
     # enable --now is a no-op on an already-active unit; restart so a re-run
     # of setup.sh actually swaps the running process to the new binary.
-    systemctl restart deployer-lb-server.service
+    systemctl restart deployer-lb-server.service \
+        || die "systemctl restart deployer-lb-server.service failed$(unit_failure_context deployer-lb-server.service)"
 }
 
 # Quantos segundos o agente precisa ficar de pé para a troca ser considerada
@@ -1280,10 +1465,12 @@ step5_systemd_agent() {
     log "step 5/6: systemd unit (deployer-lb-agent.service)"
     install -m 0644 "$REPO_ROOT/systemd/deployer-lb-agent.service" "$SYSTEMD_DIR/deployer-lb-agent.service"
     systemctl daemon-reload
-    systemctl enable --now deployer-lb-agent.service
+    systemctl enable --now deployer-lb-agent.service \
+        || die "systemctl enable --now deployer-lb-agent.service failed$(unit_failure_context deployer-lb-agent.service)"
     # enable --now is a no-op on an already-active unit; restart so a re-run
     # of setup.sh actually swaps the running process to the new binary.
-    systemctl restart deployer-lb-agent.service
+    systemctl restart deployer-lb-agent.service \
+        || die "systemctl restart deployer-lb-agent.service failed$(unit_failure_context deployer-lb-agent.service)"
 
     restart_agent_or_rollback
 }
@@ -1340,12 +1527,57 @@ restart_agent_or_rollback() {
 step6_validate_lb() {
     log "step 6/6: validation (health, nginx -t, wg ping)"
     nginx -t || die "nginx -t failed"
-    if curl -fsS "http://${LB_PORT}/v1/health" >/dev/null 2>&1; then
-        log "GET /v1/health OK"
-    else
-        log "warning: GET /v1/health did not respond yet (unit may still be starting, or --port doesn't match the listener's bind address)"
-    fi
+    validate_lb_listener
     validate_wg_peers
+}
+
+# `GET /v1/health` contra o endereço em que o listener DEVERIA estar.
+#
+# Isto já existia e só logava warning — e era o último portão antes de o
+# provisionamento reportar sucesso. Com ele mudo, um listener que morre no boot
+# (token vazio, template que não executa, bind num IP que ainda não subiu)
+# chegava à central como host provisionado, e o sintoma só aparecia depois, na
+# tela do LB, como `connection refused` sem causa.
+#
+# A distinção que o `die` respeita: unidade ainda subindo é lentidão, e continua
+# warning. Unidade morta, ou em laço de restart, é falha — e falha alto, com o
+# journal junto, porque a causa real nunca está no exit code do curl.
+#
+# `NRestarts` é o que separa "ainda subindo" de "subindo e morrendo em
+# seguida": entre dois crashes o systemd reporta `activating`, e só o contador
+# denuncia o laço. Mesmo critério de restart_agent_or_rollback.
+LB_HEALTH_RETRIES="${LB_HEALTH_RETRIES:-10}"
+
+validate_lb_listener() {
+    local unit="deployer-lb-server.service"
+    local i
+
+    # O step 5 acabou de reiniciar a unit: a primeira tentativa chega antes de
+    # o processo abrir o socket mais vezes do que não.
+    for ((i = 1; i <= LB_HEALTH_RETRIES; i++)); do
+        if curl -fsS "http://${LB_PORT}/v1/health" >/dev/null 2>&1; then
+            log "GET /v1/health OK"
+            return 0
+        fi
+        sleep 1
+    done
+
+    # Sem a unit instalada (checkout sem systemd/) não há o que cobrar.
+    if [[ ! -f "$SYSTEMD_DIR/deployer-lb-server.service" ]]; then
+        log "warning: GET /v1/health did not respond and ${unit} is not installed in this checkout"
+        return 0
+    fi
+
+    local state restarts
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    restarts="$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)"
+
+    if [[ "$state" == "activating" && "${restarts:-0}" -le 1 ]]; then
+        log "warning: GET /v1/health did not respond after ${LB_HEALTH_RETRIES}s — ${unit} is still ${state}"
+        return 0
+    fi
+
+    die "the LB listener is not answering GET http://${LB_PORT}/v1/health after ${LB_HEALTH_RETRIES}s (${unit} is ${state:-unknown}, restarts=${restarts:-0})$(unit_failure_context "$unit")"
 }
 
 step6_validate_agent() {
@@ -1436,6 +1668,7 @@ main() {
         lb)
             step1_deps_lb
             step2_wireguard_lb
+            step2b_mesh_names
             step3_binary_lb
             step4_config_lb
             step5_systemd_lb
@@ -1446,6 +1679,7 @@ main() {
         agent)
             step1_deps_agent
             step2_wireguard_agent
+            step2b_mesh_names
             step3_binary_agent
             step4_config_agent
             step5_systemd_agent

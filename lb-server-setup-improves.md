@@ -44,6 +44,24 @@ fallback em si.
 - `selfApi/api/services/backoffice/deploy/targets.py` (`lb_origin`) — item do
   IP público, único ponto tocado fora deste repo
 
+## Já aplicado (incidente do listener morto, nov/2026)
+
+**A2**, **A4** e **A5** saíram juntos, puxados pelo `connection refused` na
+8443: o listener não subia (template em disco de `main` contra binário
+v0.6.4 — ver a seção do template no README), e nenhum dos dois portões
+seguintes acusou. `step5_systemd_lb`/`step5_systemd_agent` agora conferem o
+exit code do `systemctl`, `step6_validate_lb` reprova quando a unit não está
+`active`/`activating`, ambos anexando `systemctl status` + `journalctl`
+(`unit_failure_context`), e `assert_lb_port_not_public` barra um `--port`
+fora do loopback e da /24 do WireGuard. Fixados em
+`scripts/test-lb-listener-guards.sh`.
+
+**A1** segue pendente no sentido original (era um fix no `selfApi`), mas o
+backend que atende o painel hoje é o `workspacefy-backoffice-api`, e lá
+`provisioning.lbListenAddr`/`nginxview.lbOrigin` já resolvem
+wireguard-first — com `public_ip`/`hostname` ainda no fallback, que é o que
+A2 agora barra na entrada do alvo.
+
 ## Alta severidade
 
 **A1. `lb_origin()` nunca deve cair para IP público (`selfApi/targets.py`)**

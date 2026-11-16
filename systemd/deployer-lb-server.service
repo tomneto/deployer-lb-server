@@ -1,9 +1,19 @@
 [Unit]
 Description=Deployer LB Server (nginx apply listener, mode "lb")
 Documentation=https://github.com/tomneto/deployer-lb-server
-After=network-online.target nginx.service
-Wants=network-online.target
+# wg-quick@wg0 entra aqui porque este listener BINDA no IP do WireGuard
+# (LB_LISTEN_ADDR, escrito por setup.sh). Num boot em que o wg0 sobe depois, o
+# bind falha com "cannot assign requested address", o processo morre antes de
+# servir, e o que a central vê na 8443 é `connection refused` — o mesmo sintoma
+# de um listener que nunca existiu. O unit do agente já declarava esta ordem.
+After=network-online.target nginx.service wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
 Requires=nginx.service
+# Sem isto, cinco falhas em dez segundos (o padrão) deixam a unidade morta de
+# vez: uma dependência lenta vira uma porta de controle que não volta nem
+# depois que a causa passa. O laço de restart é ruidoso no journal, e é o que
+# se quer — ruído que se vê é melhor que silêncio que não se vê.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
