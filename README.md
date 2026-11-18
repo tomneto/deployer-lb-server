@@ -168,6 +168,28 @@ bash scripts/test-lb-listener-guards.sh
 Também sem docker e sem systemd: extrai as funções reais do `setup.sh` e as
 exercita contra stubs de `systemctl`/`curl`/`journalctl`.
 
+E dois que cobrem o que os três acima, por construção, não enxergavam — eles
+extraem corpos de função com `sed` e os chamam isolados, de modo que o código
+de TOPO do `setup.sh` (o parse de flags e a validação de argumentos) nunca era
+executado por teste nenhum:
+
+```
+bash scripts/test-setup-function-order.sh
+bash scripts/test-setup-arg-validation.sh
+```
+
+O primeiro é estático: nenhuma linha de topo pode chamar função definida mais
+abaixo. Bash só conhece uma função depois de ter LIDO a definição, então uma
+chamada antes dela vira `command not found` — exit **127**, antes do primeiro
+passo, e sem linha `ERROR:` no log porque `die()` nunca roda. É o primo shell
+do `check:tdz` do frontend.
+
+O segundo invoca o `setup.sh` de verdade, com `id` e `sudo` stubados para que
+`elevate_to_root` pare na porta do primeiro passo: confere que o parse termina
+nos dois modos e que cada argumento recusado traz a própria mensagem. Os dois
+aceitam um caminho como argumento, para se conferir que REPROVAM uma versão
+quebrada (`git show v0.7.0:setup.sh > /tmp/x.sh`) e não só aprovam a atual.
+
 No Docker, no network — extracts the real function out of `setup.sh` and
 exercises it against a throwaway local git repo + fake binaries.
 
@@ -184,6 +206,15 @@ Ubuntu 24.04 / Oracle Linux 9 containers with real systemd
 **Never run automatically** — hosted CI runners don't reliably grant
 `--privileged`/cgroup access to nested containers; see that script's own
 header.
+
+**Rode-o antes de cortar release, mesmo que os testes do tier 1 estejam
+verdes.** Ele é o único lugar onde o `setup.sh` encontra um host de verdade, e
+a v0.7.0 mostrou o preço de pular: três paredes que nenhum teste de unidade vê
+— uma função chamada antes de ser definida (exit 127 em qualquer distro), o
+binário `hostname` que o Oracle Linux 9 não traz (exit 127 na primeira linha,
+pelo `set -e` numa substituição de comando), e o `default_server` que o pacote
+do nginx já instala no Debian/Ubuntu, que faz o `nginx -t` do passo 4 recusar
+a config com "a duplicate default server for 0.0.0.0:80".
 
 ### 3. Agent-over-real-SSH integration test — manual only, local before release
 

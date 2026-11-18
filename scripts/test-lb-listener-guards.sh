@@ -29,12 +29,18 @@ SETUP_SH="$REPO_ROOT/setup.sh"
 MODE="test"
 log() { printf '[test][%s] %s\n' "$MODE" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+# Mesma definição do setup.sh. Sem ela, um `have x` dentro de uma função
+# extraída vira "command not found" — que num `if` é só "falso", e o teste
+# passa a exercitar um ramo diferente do que pensa estar exercitando.
+have() { command -v "$1" >/dev/null 2>&1; }
 
 extract() { eval "$(sed -n "/^$1() {/,/^}/p" "$SETUP_SH")"; }
 # Uma espera de verdade deixaria o teste em LB_HEALTH_RETRIES segundos por
 # caso; o que importa aqui é a decisão, não o relógio.
 sleep() { :; }
 
+extract existing_default_server
+extract clear_distro_default_site
 extract write_lb_env
 extract assert_lb_port_not_public
 extract validate_lb_listener
@@ -178,5 +184,87 @@ if [[ "${result%%|*}" != 0 && "${result#*|}" == *"restarts=5"* ]]; then
 else
     failed "crash loop must die, got rc=${result%%|*} out=${result#*|}"
 fi
+
+# --- existing_default_server / clear_distro_default_site -------------------
+#
+# Dois `default_server` na mesma porta é `nginx -t` vermelho, e foi assim que
+# o passo 4 morreu no fixture Ubuntu: o pacote do nginx já traz
+# sites-enabled/default. O que se fixa aqui é a decisão — medir pelo dump, e
+# remover só o symlink do pacote.
+
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+NGINX_SITES_ENABLED="$work/sites-enabled"
+mkdir -p "$NGINX_SITES_ENABLED" "$work/sites-available"
+touch "$work/sites-available/default"
+
+# $1 = corpo do `nginx -T` (vazio = o dump falha)
+stub_nginx_dump() {
+    if [[ -z "${1:-}" ]]; then
+        write_stub nginx 'exit 1'
+        return
+    fi
+    printf '#!/usr/bin/env bash\ncat <<'"'"'DUMP'"'"'\n%s\nDUMP\n' "$1" > "$stub_dir/nginx"
+    chmod +x "$stub_dir/nginx"
+}
+
+DUMP_STOCK="# configuration file /etc/nginx/nginx.conf:
+http {
+# configuration file $work/sites-enabled/default:
+server {
+    listen 80 default_server;
+}"
+
+DUMP_OURS_ONLY="# configuration file /etc/nginx/conf.d/00-default.conf:
+server {
+    listen 80 default_server;
+    return 444;
+}"
+
+stub_nginx_dump "$DUMP_STOCK"
+got="$(existing_default_server)"
+if [[ "$got" == "$work/sites-enabled/default" ]]; then
+    ok "existing_default_server aponta o arquivo que declara o default alheio"
+else
+    failed "esperava o site da distro, veio '$got'"
+fi
+
+stub_nginx_dump "$DUMP_OURS_ONLY"
+got="$(existing_default_server)"
+[[ -z "$got" ]] && ok "o nosso próprio catch-all não conta como rival" \
+    || failed "o nosso catch-all foi contado como rival: '$got'"
+
+stub_nginx_dump ""
+got="$(existing_default_server)"
+[[ "$got" == "?" ]] && ok "dump que não roda responde '?', não 'não há'" \
+    || failed "esperava '?' quando o nginx -T falha, veio '$got'"
+
+# O symlink do pacote, intacto: sai da frente.
+ln -sf "$work/sites-available/default" "$NGINX_SITES_ENABLED/default"
+write_stub dpkg 'exit 0'   # --verify silencioso = conffile intacto
+if clear_distro_default_site >/dev/null 2>&1 && [[ ! -e "$NGINX_SITES_ENABLED/default" ]]; then
+    ok "o site padrão do pacote é removido, e só o symlink"
+else
+    failed "o symlink stock deveria ter sido removido"
+fi
+[[ -f "$work/sites-available/default" ]] \
+    && ok "sites-available/default continua lá (a remoção é reversível)" \
+    || failed "a remoção apagou o arquivo de verdade"
+
+# Editado à mão: não se toca.
+ln -sf "$work/sites-available/default" "$NGINX_SITES_ENABLED/default"
+write_stub dpkg 'echo "??5??????   /etc/nginx/sites-available/default"'
+if clear_distro_default_site >/dev/null 2>&1; then
+    failed "um default editado à mão não pode ser removido"
+else
+    [[ -L "$NGINX_SITES_ENABLED/default" ]] \
+        && ok "default editado à mão é preservado, e a função recusa" \
+        || failed "a função recusou mas apagou assim mesmo"
+fi
+
+# Sem sites-enabled (família RHEL): nada a fazer, e não é erro de execução.
+rm -f "$NGINX_SITES_ENABLED/default"
+clear_distro_default_site >/dev/null 2>&1 \
+    && failed "sem symlink a função deveria recusar" \
+    || ok "host sem sites-enabled: a função apenas recusa, sem tocar em nada"
 
 exit "$fail"

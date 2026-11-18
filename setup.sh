@@ -82,6 +82,10 @@ NGINX_TEMPLATE_DIR="/etc/nginx/lb-templates"
 # testando um template diferente a preenche, pelo ambiente.
 NGINX_TEMPLATE_PATH="${NGINX_TEMPLATE_PATH:-}"
 NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
+# O diretório de sites da família Debian. Variável pelo mesmo motivo de
+# LB_ENV_DIR: é o que deixa o teste exercitar a função real contra uma árvore
+# descartável. Numa máquina RHEL ele simplesmente não existe.
+NGINX_SITES_ENABLED="${NGINX_SITES_ENABLED:-/etc/nginx/sites-enabled}"
 # As páginas de erro da borda. Ficam sob /etc/nginx, e não em /usr/share,
 # por duas razões concretas: o `restorecon` do ensure_selinux_compat já é
 # aplicado nessa árvore, e o unit do listener já declara
@@ -93,9 +97,23 @@ NGINX_MIN_VERSION="1.18.0"
 # estável pós-mainline, piso seguro pra qualquer distro atual.
 WG_MIN_VERSION="1.0.20200513"
 
+# Nomes de malha (ambos os modos). Vazios por padrão: sem --net-name o passo
+# de publicação é pulado inteiro, que é o que mantém uma central antiga
+# funcionando contra um setup.sh novo.
+NET_NAME=""
+NET_HOSTS=""
+
 # agent-mode options
 INTAKE_URL=""
-AGENT_ID="$(hostname -f 2>/dev/null || hostname)"
+# O nome do host, sem depender do binário `hostname`.
+#
+# Oracle Linux 9 (e qualquer imagem mínima da família RHEL) não traz o pacote
+# `hostname`. Em `AGENT_ID="$(hostname …)"` a substituição falhando derruba o
+# script inteiro pelo `set -e` — e não como erro de hostname: como exit 127 na
+# primeira linha executável, antes de qualquer passo, que é o que o painel
+# mostra. `/proc/sys/kernel/hostname` é do kernel e sempre existe, e o `echo`
+# final é builtin: nem um PATH vazio consegue abortar esta atribuição.
+AGENT_ID="$(hostname -f 2>/dev/null || hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown-host)"
 AGENT_TOKEN=""
 AGENT_INTERVAL="8"
 # 1 = collect per-container stats (see write_agent_env). Overridable from the
@@ -221,6 +239,27 @@ detect_os() {
     have dnf && family="rhel"
     have yum && [[ "$family" == "unknown" ]] && family="rhel"
     log "detected distro: ${OS_ID} ${OS_VERSION_ID} (package family: ${family})"
+}
+
+# Espelho PARCIAL de ValidateNetName (targets/netname.go) e de netNameErrors
+# (netNameModel.js): aqui só o formato do rótulo. Nome reservado (`wg`,
+# `localhost`, `hub`, …) e nome só de dígitos as outras duas pontas recusam e
+# esta não — a central valida antes de montar o `--net-name`, então a brecha
+# só aparece para quem roda este script à mão. Está registrado, e não é o que
+# esta correção veio consertar.
+#
+# Esta definição precisa vir ANTES do bloco de validação de argumentos lá
+# embaixo, e isso não é preferência de organização: o bloco é código de topo,
+# que o bash executa enquanto LÊ o arquivo, e uma função só existe depois que
+# a linha que a define foi lida. Definida junto do resto da malha (onde ela
+# estava), a chamada caía num nome inexistente — `command not found`, exit
+# 127, antes de qualquer passo, nos dois modos. Um provisionamento inteiro da
+# frota parou por isso; `scripts/test-setup-function-order.sh` existe para
+# que não pare de novo.
+validate_net_name() {
+    [[ -n "${NET_NAME:-}" ]] || return 0
+    [[ "$NET_NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+        || die "--net-name '$NET_NAME' não é um rótulo DNS: só letras minúsculas, dígitos e hífen, sem começar nem terminar com hífen"
 }
 
 # ---------------------------------------------------------------------------
@@ -873,13 +912,9 @@ ensure_wg_keypair() {
 # existe, e o bloco é escrito depois que o túnel sobe. Aqueles dois
 # continuam estritamente IP e endpoint público.
 
-# Espelho de ValidateNetName (targets/netname.go) e de netNameErrors
-# (netNameModel.js). As três pontas têm de recusar o mesmo conjunto.
-validate_net_name() {
-    [[ -n "${NET_NAME:-}" ]] || return 0
-    [[ "$NET_NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
-        || die "--net-name '$NET_NAME' não é um rótulo DNS: só letras minúsculas, dígitos e hífen, sem começar nem terminar com hífen"
-}
+# `validate_net_name` mora lá em cima, junto do parse de argumentos — e não
+# aqui, com o resto da malha. O porquê está no comentário dela: quem a chama é
+# código de topo, e bash só conhece uma função depois de ter LIDO a definição.
 
 # Regenera o bloco inteiro; NUNCA anexa.
 #
@@ -1306,6 +1341,48 @@ ensure_conf_dir_included() {
     log "incluí $dir em $main (backup em $backup)"
 }
 
+# Quem já declara `default_server` na porta 80 neste host, além de nós.
+#
+# Ecoa o caminho do arquivo que declara, ou nada. Mede pelo `nginx -T` (a
+# config COMO O NGINX A LÊ) em vez de varrer /etc/nginx no escuro: só o dump
+# sabe o que está realmente incluído. Se o dump não roda, ecoa `?` — "não sei"
+# é resposta diferente de "não há", e quem chama trata as duas diferente.
+existing_default_server() {
+    local dump
+    dump="$(nginx -T 2>/dev/null)" || { echo "?"; return 0; }
+    printf '%s\n' "$dump" | awk -v ours="$NGINX_CONF_DIR/00-default.conf" '
+        /^# configuration file / { file = $4; sub(/:$/, "", file); next }
+        /listen[^;]*default_server/ { if (file != ours) { print file; exit } }
+    '
+}
+
+# O site padrão que o pacote do nginx instala na família Debian compete com o
+# nosso catch-all: dois `default_server` na mesma porta é `nginx -t` vermelho,
+# e o passo 4 morre com "a duplicate default server for 0.0.0.0:80".
+#
+# Remove o symlink SÓ quando ele é o do pacote, intacto — e isso é medido com
+# `dpkg --verify`, não presumido: o arquivo é um conffile, então o dpkg sabe
+# dizer se alguém o editou. Editado significa que é config de alguém, e nesse
+# caso esta função não toca em nada e diz que não conseguiu.
+#
+# Remover o symlink é reversível: o arquivo continua em sites-available, e
+# `ln -s` o traz de volta.
+#
+# Devolve 0 quando a porta 80 ficou livre para o nosso catch-all.
+clear_distro_default_site() {
+    local stock="$NGINX_SITES_ENABLED/default"
+    [[ -L "$stock" ]] || return 1
+
+    if have dpkg && dpkg --verify nginx-common 2>/dev/null | grep -q 'sites-available/default'; then
+        log "warning: $stock aponta para um default editado à mão — não vou removê-lo"
+        return 1
+    fi
+
+    rm -f "$stock"
+    log "removido $stock (site padrão do pacote; o arquivo segue em sites-available/default)"
+    return 0
+}
+
 step4_config_lb() {
     log "step 4/6: config (template, snippets, error pages, default_server catch-all)"
     mkdir -p "$NGINX_TEMPLATE_DIR" "$NGINX_SNIPPETS_DIR" "$NGINX_CONF_DIR" "$NGINX_ERRORS_DIR"
@@ -1321,9 +1398,29 @@ step4_config_lb() {
     # doesn't know about yet — without it nginx falls back to the first
     # server block alphabetically, serving the wrong app.
     local default_conf="$NGINX_CONF_DIR/00-default.conf"
-    if [[ -f "$default_conf" ]] && ! grep -q "managed-by: deployer-lb-server" "$default_conf"; then
+
+    # Quem mais reivindica a porta 80 como default. Medido ANTES de escrever o
+    # nosso, senão o nosso aparece na medição.
+    local rival
+    rival="$(existing_default_server)"
+    if [[ -n "$rival" && "$rival" != "?" ]]; then
+        # O site do pacote sai da frente; qualquer outro é config de alguém.
+        if [[ "$rival" == "$NGINX_SITES_ENABLED/default" ]] && clear_distro_default_site; then
+            rival=""
+        fi
+    fi
+
+    if [[ -n "$rival" && "$rival" != "?" ]]; then
+        # Escrever o nosso aqui deixaria `nginx -t` vermelho e mataria o passo
+        # 4 — e o catch-all é uma rede de segurança, não a razão deste script
+        # existir. Avisa alto e segue: um default alheio ainda responde por
+        # domínio desconhecido, só que servindo o primeiro vhost em vez de 444.
+        log "warning: $rival já declara default_server na porta 80 — não instalo o catch-all (D19) neste host"
+        log "warning: para o catch-all valer, remova o default_server de $rival e rode este script de novo"
+    elif [[ -f "$default_conf" ]] && ! grep -q "managed-by: deployer-lb-server" "$default_conf"; then
         log "warning: $default_conf exists and is not managed by us — leaving it untouched"
     else
+        [[ "$rival" == "?" ]] && log "warning: 'nginx -T' não rodou — escrevendo o catch-all sem poder medir se há outro default_server"
         cat > "$default_conf" <<'EOF'
 # managed-by: deployer-lb-server (default_server catch-all — D19)
 server {

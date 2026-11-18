@@ -69,8 +69,13 @@ for i in "${!SERVICES[@]}"; do
     wg_ip="${WG_IPS[$i]}"
 
     echo "== [$svc] waiting for systemd to be ready =="
+    # 30s não bastava: o container Ubuntu INSTALA o systemd no próprio boot
+    # (apt-get update + install antes do `exec /sbin/init`), e numa máquina
+    # fria isso passa de um minuto. A espera curta fazia o fixture pular o
+    # Ubuntu e ainda assim reprovar o run — ou seja, a única distro da família
+    # Debian ficava sem cobertura exatamente quando se mexia no nginx dela.
     ready=0
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 240); do
         if docker exec "$svc" systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded'; then
             ready=1
             break
@@ -88,7 +93,15 @@ for i in "${!SERVICES[@]}"; do
 
     echo "== [$svc] running setup.sh $MODE =="
     if [[ "$MODE" == "lb" ]]; then
+        # As credenciais do listener são obrigatórias para o binário sequer
+        # subir (cmd/apply-server morre sem LB_TOKEN/LB_SHARED_SECRET), e a
+        # central sempre as passa. Sem elas aqui, o fixture provisionava um
+        # host cujo listener entrava em laço de restart — e o passo 6 só
+        # avisava, então o teste ficava verde sobre uma porta morta. Desde que
+        # o passo 6 reprova, isto virou a diferença entre exercitar o caminho
+        # real e exercitar um que a produção nunca percorre.
         cmd="bash setup.sh lb --wg-ip ${wg_ip} --wg-port 51820"
+        cmd+=" --lb-token smoke-test-token --lb-secret smoke-test-secret"
     else
         cmd="bash setup.sh agent --intake-url https://example.invalid/infra/agent/report --agent-token smoke-test-token --wg-ip ${wg_ip}"
     fi
